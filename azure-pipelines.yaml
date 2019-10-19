@@ -9,7 +9,7 @@ stages:
     steps:
     - task: UsePythonVersion@0
       inputs:
-        versionSpec: '3.7'
+        versionSpec: '3.8'
 
     - script: pip install flake8 mypy
       displayName: Install dependencies
@@ -28,7 +28,7 @@ stages:
       matrix:
         Linux-Py35:
           imageName: 'ubuntu-16.04'
-          python.version: '3.5'
+          python.version: '3.6'
         Linux-Py38:
           imageName: 'ubuntu-latest'
           python.version: '3.8'
@@ -37,13 +37,13 @@ stages:
           python.version: 'pypy3'
         Mac-Py35:
           imageName: 'macos-10.13'
-          python.version: '3.5'
+          python.version: '3.6'
         Mac-Py38:
           imageName: 'macos-latest'
           python.version: '3.8'
         Win-Py35:
           imageName: 'vs2017-win2016'
-          python.version: '3.5'
+          python.version: '3.6'
         Win-Py38:
           imageName: 'windows-latest'
           python.version: '3.8'
@@ -88,7 +88,7 @@ stages:
     steps:
     - task: UsePythonVersion@0
       inputs:
-        versionSpec: '3.7'
+        versionSpec: '3.8'
 
     - script: pip install twine
       displayName: Install Twine

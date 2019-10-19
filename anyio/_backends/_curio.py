@@ -4,9 +4,12 @@ from collections import OrderedDict
 from concurrent.futures import Future
 from functools import partial
 from threading import Thread
-from typing import Callable, Set, Optional, Coroutine, Any, cast, Dict, List, Sequence
+from typing import (
+    Callable, Set, Optional, Coroutine, Any, cast, Dict, List, Sequence, ClassVar,
+    Generic, Type)
 from weakref import WeakKeyDictionary
 
+import attr
 import curio.io
 import curio.meta
 import curio.socket
@@ -14,10 +17,19 @@ import curio.ssl
 import curio.traps
 from async_generator import async_generator, asynccontextmanager, yield_
 
-from .. import abc, T_Retval, claim_worker_thread, TaskInfo, _local
+from .. import T_Retval, claim_worker_thread, TaskInfo, _local, T_Item
+from ..abc.networking import (
+    TCPSocketStream as AbstractTCPSocketStream, UNIXSocketStream as AbstractUNIXSocketStream,
+    UDPPacket, UDPSocket as AbstractUDPSocket, ConnectedUDPSocket as AbstractConnectedUDPSocket,
+    TCPListener as AbstractTCPListener, UNIXListener as AbstractUNIXListener
+)
+from ..abc.streams import ByteStream, MessageStream
+from ..abc.synchronization import (
+    Lock as AbstractLock, Condition as AbstractCondition, Event as AbstractEvent,
+    Semaphore as AbstractSemaphore, CapacityLimiter as AbstractCapacityLimiter)
+from ..abc.tasks import CancelScope as AbstractCancelScope, TaskGroup as AbstractTaskGroup
 from ..exceptions import (
-    ExceptionGroup as BaseExceptionGroup, ClosedResourceError, ResourceBusyError, WouldBlock)
-from .._networking import BaseSocket
+    ExceptionGroup as BaseExceptionGroup, ClosedResourceError, BusyResourceError, WouldBlock)
 
 
 #
@@ -177,7 +189,7 @@ class CancelScope:
         return self._shield
 
 
-abc.CancelScope.register(CancelScope)
+AbstractCancelScope.register(CancelScope)
 
 
 async def check_cancelled():
@@ -339,7 +351,7 @@ class TaskGroup:
         self.cancel_scope._tasks.add(task)
 
 
-abc.TaskGroup.register(TaskGroup)
+AbstractTaskGroup.register(TaskGroup)
 
 
 #
@@ -414,68 +426,215 @@ async def aopen(*args, **kwargs):
 # Sockets and networking
 #
 
-_reader_tasks = {}  # type: Dict[socket.SocketType, curio.Task]
-_writer_tasks = {}  # type: Dict[socket.SocketType, curio.Task]
+@attr.s(slots=True, auto_attribs=True)
+class StreamMixin:
+    raw_socket: socket.SocketType
+    _curio_socket: curio.io.Socket
+    _receiver_task: Optional[curio.Task] = None
+    _sender_task: Optional[curio.Task] = None
+
+    async def aclose(self) -> None:
+        self.raw_socket.close()
+        if self._receiver_task:
+            await self._receiver_task.cancel(exc=ClosedResourceError)
+        if self._sender_task:
+            await self._sender_task.cancel(exc=ClosedResourceError)
+
+    async def receive(self, max_bytes: Optional[int] = None) -> bytes:
+        await check_cancelled()
+        if self.raw_socket.fileno() < 0:
+            raise ClosedResourceError
+        if self._receiver_task:
+            raise BusyResourceError('receiving from')
+
+        self._receiver_task = await curio.current_task()
+        try:
+            return await self._curio_socket.recv(max_bytes or 65536)
+        except (ConnectionResetError, OSError) as exc:
+            self.raw_socket.close()
+            raise ClosedResourceError from exc
+        finally:
+            self._receiver_task = None
+
+    async def send(self, item: bytes) -> None:
+        await check_cancelled()
+        if self.raw_socket.fileno() < 0:
+            raise ClosedResourceError
+        if self._sender_task:
+            raise BusyResourceError('sending from')
+
+        self._sender_task = await curio.current_task()
+        try:
+            await self._curio_socket.sendall(item)
+        except (ConnectionResetError, OSError) as exc:
+            self.raw_socket.close()
+            raise ClosedResourceError from exc
+        finally:
+            self._sender_task = None
 
 
-class Socket(BaseSocket):
-    __slots__ = ()
+@attr.s(slots=True, auto_attribs=True)
+class ListenerMixin:
+    stream_class: ClassVar[Type[ByteStream]]
+    raw_socket: socket.SocketType
+    _curio_socket: curio.io.Socket
+    _accepter_task: Optional[curio.Task] = None
 
-    def _wait_readable(self):
-        return wait_socket_readable(self._raw_socket)
+    async def aclose(self):
+        self.raw_socket.close()
+        if self._accepter_task:
+            await self._accepter_task.cancel(exc=ClosedResourceError)
 
-    def _wait_writable(self):
-        return wait_socket_writable(self._raw_socket)
+    async def accept(self) -> socket.SocketType:
+        await check_cancelled()
+        if self.raw_socket.fileno() < 0:
+            raise ClosedResourceError
+        if self._accepter_task:
+            raise BusyResourceError('accepting connections from')
 
-    def _notify_close(self):
-        return notify_socket_close(self._raw_socket)
+        self._accepter_task = await curio.current_task()
+        try:
+            curio_socket, address = await self._curio_socket.accept()
+        finally:
+            self._accepter_task = None
 
-    def _check_cancelled(self) -> Coroutine[Any, Any, None]:
-        return check_cancelled()
-
-    def _run_in_thread(self, func: Callable, *args):
-        return run_in_thread(func, *args)
+        return self.stream_class(raw_socket=curio_socket._socket, curio_socket=curio_socket)
 
 
-async def wait_socket_readable(sock):
-    await check_cancelled()
-    if _reader_tasks.get(sock):
-        raise ResourceBusyError('reading from') from None
+@attr.s(slots=True, auto_attribs=True)
+class TCPSocketStream(StreamMixin, AbstractTCPSocketStream):
+    async def send_eof(self) -> None:
+        self.raw_socket.shutdown(socket.SHUT_WR)
 
-    _reader_tasks[sock] = await curio.current_task()
+
+async def connect_tcp(raw_socket: socket.SocketType, remote_address) -> AbstractTCPSocketStream:
+    curio_socket = curio.io.Socket(raw_socket)
+    await curio_socket.connect(remote_address)
+    return TCPSocketStream(raw_socket=raw_socket, curio_socket=curio_socket)
+
+
+class TCPListener(ListenerMixin, AbstractTCPListener):
+    stream_class = TCPSocketStream
+
+
+async def create_tcp_listener(raw_socket: socket.SocketType) -> AbstractTCPListener:
+    curio_socket = curio.io.Socket(raw_socket)
+    return TCPListener(raw_socket=raw_socket, curio_socket=curio_socket)
+
+
+@attr.s(slots=True, auto_attribs=True)
+class UNIXSocketStream(StreamMixin, AbstractUNIXSocketStream):
+    async def send_eof(self) -> None:
+        self.raw_socket.shutdown(socket.SHUT_WR)
+
+
+async def connect_unix(raw_socket: socket.SocketType,
+                       remote_address: str) -> AbstractUNIXSocketStream:
+    curio_socket = curio.io.Socket(raw_socket)
+    await curio_socket.connect(remote_address)
+    return UNIXSocketStream(raw_socket=raw_socket, curio_socket=curio_socket)
+
+
+class UNIXListener(ListenerMixin, AbstractUNIXListener):
+    stream_class = UNIXSocketStream
+
+
+async def create_unix_listener(raw_socket: socket.SocketType) -> AbstractUNIXListener:
+    curio_socket = curio.io.Socket(raw_socket)
+    return UNIXListener(raw_socket=raw_socket, curio_socket=curio_socket)
+
+
+class UDPSocket(AbstractUDPSocket):
+    receiver_task: Optional[curio.Task] = None
+    sender_task: Optional[curio.Task] = None
+
+    def __init__(self, sock: socket.SocketType):
+        self.raw_socket = sock
+        self._curio_socket = curio.io.Socket(sock)
+
+    async def aclose(self) -> None:
+        await self._curio_socket.close()
+        if self.receiver_task:
+            await self.receiver_task.cancel(exc=ClosedResourceError, blocking=False)
+        if self.sender_task:
+            await self.sender_task.cancel(exc=ClosedResourceError, blocking=False)
+
+    async def receive(self) -> UDPPacket:
+        await check_cancelled()
+        if self.raw_socket.fileno() < 0:
+            raise ClosedResourceError
+        if self.receiver_task:
+            raise BusyResourceError('receiving from')
+
+        self.receiver_task = await curio.current_task()
+        try:
+            return UDPPacket(*await self._curio_socket.recvfrom(65536))
+        finally:
+            del self.receiver_task
+
+    async def send(self, item: UDPPacket) -> None:
+        await check_cancelled()
+        if self.raw_socket.fileno() < 0:
+            raise ClosedResourceError
+        if self.sender_task:
+            raise BusyResourceError('sending from')
+
+        self.sender_task = await curio.current_task()
+        try:
+            await self._curio_socket.sendto(*item)
+        finally:
+            del self.sender_task
+
+
+class ConnectedUDPSocket(AbstractConnectedUDPSocket):
+    _receiver_task: Optional[curio.Task] = None
+    _sender_task: Optional[curio.Task] = None
+
+    def __init__(self, sock: socket.SocketType):
+        self.raw_socket = sock
+        self._curio_socket = curio.io.Socket(sock)
+
+    async def aclose(self) -> None:
+        await self._curio_socket.close()
+        if self._receiver_task:
+            await self._receiver_task.cancel(exc=ClosedResourceError, blocking=False)
+        if self._sender_task:
+            await self._sender_task.cancel(exc=ClosedResourceError, blocking=False)
+
+    async def receive(self) -> bytes:
+        await check_cancelled()
+        if self.raw_socket.fileno() < 0:
+            raise ClosedResourceError
+        if self._receiver_task:
+            raise BusyResourceError('receiving from')
+
+        self._receiver_task = await curio.current_task()
+        try:
+            return await self._curio_socket.recv(65536)
+        finally:
+            del self._receiver_task
+
+    async def send(self, item: bytes) -> None:
+        await check_cancelled()
+        if self.raw_socket.fileno() < 0:
+            raise ClosedResourceError
+        if self._sender_task:
+            raise BusyResourceError('sending from')
+
+        self._sender_task = await curio.current_task()
+        try:
+            await self._curio_socket.send(item)
+        finally:
+            del self._sender_task
+
+
+async def create_udp_socket(raw_socket: socket.SocketType):
     try:
-        return await curio.traps._read_wait(sock)
-    except CancelledError:
-        if sock.fileno() == -1:
-            raise ClosedResourceError from None
-        else:
-            raise
-    finally:
-        del _reader_tasks[sock]
-
-
-async def wait_socket_writable(sock):
-    await check_cancelled()
-    if _writer_tasks.get(sock):
-        raise ResourceBusyError('writing to') from None
-
-    _writer_tasks[sock] = await curio.current_task()
-    try:
-        return await curio.traps._write_wait(sock)
-    except CancelledError:
-        if sock.fileno() == -1:
-            raise ClosedResourceError from None
-        else:
-            raise
-    finally:
-        del _writer_tasks[sock]
-
-
-async def notify_socket_close(sock: socket.SocketType):
-    for tasks_map in _reader_tasks, _writer_tasks:
-        task = tasks_map.get(sock)
-        if task is not None:
-            await task.cancel(blocking=False)
+        raw_socket.getpeername()
+    except OSError:
+        return UDPSocket(raw_socket)
+    else:
+        return ConnectedUDPSocket(raw_socket)
 
 
 #
@@ -510,21 +669,51 @@ class Semaphore(curio.Semaphore):
         return await super().__aenter__()
 
 
-class Queue(curio.Queue):
-    async def get(self):
-        await check_cancelled()
-        return await super().get()
+@attr.s(auto_attribs=True, slots=True)
+class MemoryMessageStream(Generic[T_Item], MessageStream[T_Item]):
+    _closed: bool = attr.ib(init=False, default=False)
+    _send_event: curio.Event = attr.ib(init=False, factory=curio.Event)
+    _receive_events: Dict[curio.Event, List[T_Item]] = attr.ib(init=False, factory=OrderedDict)
 
-    async def put(self, item):
+    async def receive(self) -> T_Item:
         await check_cancelled()
-        return await super().put(item)
+        if self._closed:
+            raise ClosedResourceError
 
-    def __aiter__(self):
-        return self
+        event = curio.Event()
+        container: List[T_Item] = []
+        self._receive_events[event] = container
+        await self._send_event.set()
+        try:
+            await event.wait()
+        except BaseException:
+            self._receive_events.pop(event, None)
+            raise
 
-    async def __anext__(self):
+        try:
+            return container[0]
+        except IndexError:
+            raise ClosedResourceError from None
+
+    async def send(self, item: T_Item) -> None:
         await check_cancelled()
-        return await super().get()
+        if self._closed:
+            raise ClosedResourceError
+
+        # Wait until there's someone on the receiving end
+        if not self._receive_events:
+            self._send_event.clear()
+            await self._send_event.wait()
+
+        # Send the item to the first recipient in the line
+        event, container = self._receive_events.popitem()
+        container.append(item)
+        await event.set()
+
+    async def aclose(self) -> None:
+        self._closed = True
+        for event in self._receive_events:
+            await event.set()
 
 
 class CapacityLimiter:
@@ -626,12 +815,11 @@ def current_default_thread_limiter():
 
 _default_thread_limiter = CapacityLimiter(40)
 
-abc.Lock.register(Lock)
-abc.Condition.register(Condition)
-abc.Event.register(Event)
-abc.Semaphore.register(Semaphore)
-abc.Queue.register(Queue)
-abc.CapacityLimiter.register(CapacityLimiter)
+AbstractLock.register(Lock)
+AbstractCondition.register(Condition)
+AbstractEvent.register(Event)
+AbstractSemaphore.register(Semaphore)
+AbstractCapacityLimiter.register(CapacityLimiter)
 
 
 #

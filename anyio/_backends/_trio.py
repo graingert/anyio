@@ -1,16 +1,29 @@
 import math
-from typing import Callable, Optional, List, Union
+import socket
+from typing import Callable, Optional, List, Union, ClassVar, Generic, TypeVar, Type
 
-import trio.hazmat
+import attr
 import trio.from_thread
+import trio.hazmat
 from async_generator import async_generator, yield_, asynccontextmanager, aclosing
 from trio.to_thread import run_sync
-from trio.hazmat import wait_readable, wait_writable, notify_closing
 
-from .. import abc, claim_worker_thread, T_Retval, TaskInfo
+from .. import claim_worker_thread, TaskInfo, MessageStream
+from ..abc.networking import (
+    TCPSocketStream as AbstractTCPSocketStream, UNIXSocketStream as AbstractUNIXSocketStream,
+    UDPPacket, UDPSocket as AbstractUDPSocket, ConnectedUDPSocket as AbstractConnectedUDPSocket,
+    TCPListener as AbstractTCPListener, UNIXListener as AbstractUNIXListener
+)
+from ..abc.streams import ByteStream
+from ..abc.tasks import CancelScope as AbstractCancelScope, TaskGroup as AbstractTaskGroup
+from ..abc.synchronization import (
+    Lock as AbstractLock, Condition as AbstractCondition, Event as AbstractEvent,
+    Semaphore as AbstractSemaphore, CapacityLimiter as AbstractCapacityLimiter)
 from ..exceptions import (
-    ExceptionGroup as BaseExceptionGroup, ClosedResourceError, ResourceBusyError, WouldBlock)
-from .._networking import BaseSocket
+    ExceptionGroup as BaseExceptionGroup, WouldBlock, ClosedResourceError, BusyResourceError)
+
+T_Retval = TypeVar('T_Retval')
+T_Item = TypeVar('T_Item')
 
 #
 # Event loop
@@ -68,7 +81,7 @@ class CancelScope:
         return self.__original.shield
 
 
-abc.CancelScope.register(CancelScope)
+AbstractCancelScope.register(CancelScope)
 
 
 @asynccontextmanager
@@ -135,7 +148,7 @@ class TaskGroup:
         self._nursery.start_soon(func, *args, name=name)
 
 
-abc.TaskGroup.register(TaskGroup)
+AbstractTaskGroup.register(TaskGroup)
 
 
 #
@@ -168,47 +181,191 @@ async def aopen(*args, **kwargs):
 # Sockets and networking
 #
 
-class Socket(BaseSocket):
-    __slots__ = ()
+@attr.s(slots=True, kw_only=True, auto_attribs=True)
+class StreamMixin:
+    raw_socket: socket.SocketType
+    _trio_socket: trio.socket.SocketType
 
-    def _wait_readable(self):
-        return wait_socket_readable(self._raw_socket)
+    async def aclose(self) -> None:
+        self._trio_socket.close()
 
-    def _wait_writable(self):
-        return wait_socket_writable(self._raw_socket)
+    async def receive(self, max_bytes: Optional[int] = None) -> bytes:
+        try:
+            return await self._trio_socket.recv(max_bytes or 65536)
+        except trio.ClosedResourceError:
+            raise ClosedResourceError from None
+        except trio.BusyResourceError:
+            raise BusyResourceError('receiving from') from None
+        except (ConnectionResetError, OSError) as exc:
+            self.raw_socket.close()
+            raise ClosedResourceError from exc
 
-    async def _notify_close(self):
-        if self._raw_socket.fileno() >= 0:
-            notify_closing(self._raw_socket)
+    async def send(self, item: bytes) -> None:
+        view = memoryview(item)
+        total = len(item)
+        sent = 0
+        try:
+            while sent < total:
+                sent += await self._trio_socket.send(view[sent:])
+        except trio.ClosedResourceError:
+            raise ClosedResourceError from None
+        except trio.BusyResourceError:
+            raise BusyResourceError('sending from') from None
+        except (ConnectionResetError, OSError) as exc:
+            self.raw_socket.close()
+            raise ClosedResourceError from exc
 
-    def _check_cancelled(self):
-        return trio.hazmat.checkpoint_if_cancelled()
 
-    def _run_in_thread(self, func: Callable, *args):
-        return run_in_thread(func, *args)
+@attr.s(slots=True, auto_attribs=True)
+class ListenerMixin:
+    stream_class: ClassVar[Type[ByteStream]]
+    raw_socket: socket.SocketType
+    _trio_socket: trio.socket.SocketType
+
+    async def aclose(self):
+        self._trio_socket.close()
+
+    async def accept(self) -> ByteStream:
+        try:
+            trio_socket, address = await self._trio_socket.accept()
+        except OSError as exc:
+            if exc.errno == 9:
+                raise ClosedResourceError from None
+            else:
+                raise
+        except trio.ClosedResourceError:
+            raise ClosedResourceError from None
+        except trio.BusyResourceError:
+            raise BusyResourceError('accepting connections from') from None
+
+        return self.stream_class(raw_socket=trio_socket._sock, trio_socket=trio_socket)
 
 
-async def wait_socket_readable(sock):
+@attr.s(slots=True, auto_attribs=True)
+class TCPSocketStream(StreamMixin, AbstractTCPSocketStream):
+    pass
+
+
+@attr.s(slots=True, auto_attribs=True)
+class TCPListener(ListenerMixin, AbstractTCPListener):
+    stream_class = TCPSocketStream
+
+
+@attr.s(slots=True, auto_attribs=True)
+class UNIXSocketStream(StreamMixin, AbstractUNIXSocketStream):
+    pass
+
+
+@attr.s(slots=True, auto_attribs=True)
+class UNIXListener(ListenerMixin, AbstractUNIXListener):
+    stream_class = UNIXSocketStream
+
+
+async def connect_tcp(raw_socket: socket.SocketType,
+                      remote_address: tuple) -> AbstractTCPSocketStream:
+    # try:
+    #     raw_socket.connect(remote_address)
+    # except
+    trio_socket = trio.socket.from_stdlib_socket(raw_socket)
+    # from pdb import set_trace; set_trace()
+    # if remote_address == ('::1', 0, 0, 0):
+    #     from pdb import set_trace; set_trace()
+    await trio_socket.connect(remote_address)
+    return TCPSocketStream(raw_socket=raw_socket, trio_socket=trio_socket)
+
+
+async def connect_unix(raw_socket: socket.SocketType,
+                       remote_address: str) -> AbstractUNIXSocketStream:
+    trio_socket = trio.socket.from_stdlib_socket(raw_socket)
+    await trio_socket.connect(remote_address)
+    return UNIXSocketStream(raw_socket=raw_socket, trio_socket=trio_socket)
+
+
+async def create_tcp_listener(raw_socket: socket.SocketType) -> AbstractTCPListener:
+    trio_socket = trio.socket.from_stdlib_socket(raw_socket)
+    return TCPListener(raw_socket=raw_socket, trio_socket=trio_socket)
+
+
+async def create_unix_listener(raw_socket: socket.SocketType) -> AbstractUNIXListener:
+    trio_socket = trio.socket.from_stdlib_socket(raw_socket)
+    return UNIXListener(raw_socket=raw_socket, trio_socket=trio_socket)
+
+
+class UDPSocket(AbstractUDPSocket):
+    def __init__(self, raw_socket: socket.SocketType):
+        self.raw_socket = raw_socket
+        self._trio_socket = trio.socket.from_stdlib_socket(raw_socket)
+
+    async def aclose(self) -> None:
+        self._trio_socket.close()
+
+    async def receive(self) -> UDPPacket:
+        try:
+            return UDPPacket(*await self._trio_socket.recvfrom(65536))
+        except trio.ClosedResourceError:
+            raise ClosedResourceError from None
+        except trio.BusyResourceError:
+            raise BusyResourceError('receiving from') from None
+        except OSError:
+            if self.raw_socket.fileno() < 0:
+                raise ClosedResourceError from None
+            else:
+                raise
+
+    async def send(self, item: UDPPacket) -> None:
+        try:
+            await self._trio_socket.sendto(*item)
+        except trio.ClosedResourceError:
+            raise ClosedResourceError from None
+        except trio.BusyResourceError:
+            raise BusyResourceError('sending from') from None
+        except OSError:
+            if self.raw_socket.fileno() < 0:
+                raise ClosedResourceError from None
+
+
+class ConnectedUDPSocket(AbstractConnectedUDPSocket):
+    def __init__(self, raw_socket: socket.SocketType):
+        self.raw_socket = raw_socket
+        self._trio_socket = trio.socket.from_stdlib_socket(raw_socket)
+
+    async def aclose(self) -> None:
+        self._trio_socket.close()
+
+    async def receive(self) -> bytes:
+        try:
+            return await self._trio_socket.recv(65536)
+        except trio.ClosedResourceError:
+            raise ClosedResourceError from None
+        except trio.BusyResourceError:
+            raise BusyResourceError('receiving from') from None
+        except OSError:
+            if self.raw_socket.fileno() < 0:
+                raise ClosedResourceError from None
+            else:
+                raise
+
+    async def send(self, item: bytes) -> None:
+        try:
+            await self._trio_socket.send(item)
+        except trio.ClosedResourceError:
+            raise ClosedResourceError from None
+        except trio.BusyResourceError:
+            raise BusyResourceError('sending from') from None
+        except OSError:
+            if self.raw_socket.fileno() < 0:
+                raise ClosedResourceError from None
+            else:
+                raise
+
+
+async def create_udp_socket(raw_socket: socket.SocketType):
     try:
-        await wait_readable(sock)
-    except trio.ClosedResourceError as exc:
-        raise ClosedResourceError().with_traceback(exc.__traceback__) from None
-    except trio.BusyResourceError:
-        raise ResourceBusyError('reading from') from None
-
-
-async def wait_socket_writable(sock):
-    try:
-        await wait_writable(sock)
-    except trio.ClosedResourceError as exc:
-        raise ClosedResourceError().with_traceback(exc.__traceback__) from None
-    except trio.BusyResourceError:
-        raise ResourceBusyError('writing to') from None
-
-
-async def notify_socket_close(sock):
-    return notify_closing(sock)
-
+        raw_socket.getpeername()
+    except OSError:
+        return UDPSocket(raw_socket)
+    else:
+        return ConnectedUDPSocket(raw_socket)
 
 #
 # Synchronization
@@ -274,7 +431,7 @@ class Queue:
         return await self._receive_channel.receive()
 
 
-class CapacityLimiter(abc.CapacityLimiter):
+class CapacityLimiter(AbstractCapacityLimiter):
     def __init__(self, limiter_or_tokens: Union[float, trio.CapacityLimiter]):
         if isinstance(limiter_or_tokens, trio.CapacityLimiter):
             self._limiter = limiter_or_tokens
@@ -330,12 +487,36 @@ def current_default_thread_limiter():
     return CapacityLimiter(native_limiter)
 
 
-abc.Lock.register(Lock)
-abc.Condition.register(Condition)
-abc.Event.register(Event)
-abc.Semaphore.register(Semaphore)
-abc.Queue.register(Queue)
-abc.CapacityLimiter.register(CapacityLimiter)
+@attr.s(auto_attribs=True, init=False, slots=True)
+class MemoryMessageStream(Generic[T_Item], MessageStream[T_Item]):
+    _receive_channel: trio.abc.ReceiveChannel[T_Item]
+    _send_channel: trio.abc.SendChannel[T_Item]
+
+    def __init__(self):
+        self._send_channel, self._receive_channel = trio.open_memory_channel(0)
+
+    async def receive(self) -> T_Item:
+        try:
+            return await self._receive_channel.receive()
+        except (trio.EndOfChannel, trio.ClosedResourceError, trio.BrokenResourceError):
+            raise ClosedResourceError from None
+
+    async def send(self, item: T_Item) -> None:
+        try:
+            await self._send_channel.send(item)
+        except (trio.EndOfChannel, trio.ClosedResourceError, trio.BrokenResourceError):
+            raise ClosedResourceError from None
+
+    async def aclose(self) -> None:
+        await self._send_channel.aclose()
+        await self._receive_channel.aclose()
+
+
+AbstractLock.register(Lock)
+AbstractCondition.register(Condition)
+AbstractEvent.register(Event)
+AbstractSemaphore.register(Semaphore)
+AbstractCapacityLimiter.register(CapacityLimiter)
 
 
 #

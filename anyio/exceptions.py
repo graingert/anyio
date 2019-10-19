@@ -44,15 +44,15 @@ class DelimiterNotFound(Exception):
         super().__init__('The delimiter was not found among the first {} bytes'.format(max_bytes))
 
 
+class StreamClosed(Exception):
+    """Raised when attempting to read from a stream which has been closed from the other end."""
+
+
 class ClosedResourceError(Exception):
     """Raised when a resource is closed by another task."""
 
 
-class TLSRequired(Exception):
-    """Raised when a TLS related stream method is called before the TLS handshake has been done."""
-
-
-class ResourceBusyError(Exception):
+class BusyResourceError(Exception):
     """Raised when two tasks are trying to read from or write to the same resource concurrently."""
 
     def __init__(self, action: str):

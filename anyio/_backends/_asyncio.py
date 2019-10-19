@@ -10,15 +10,25 @@ from functools import partial
 from threading import Thread
 from typing import (
     Callable, Set, Optional, Union, Tuple, cast, Coroutine, Any, Awaitable, TypeVar, Generator,
-    List, Dict, Sequence)
+    List, Dict, Sequence, Text, ClassVar, Generic, Type)
 from weakref import WeakKeyDictionary
 
+import attr
 from async_generator import async_generator, yield_, asynccontextmanager, aclosing
 
-from .. import abc, claim_worker_thread, _local, T_Retval, TaskInfo
+from .. import claim_worker_thread, _local, T_Retval, TaskInfo, T_Item
+from ..abc.networking import (
+    TCPSocketStream as AbstractTCPSocketStream, UNIXSocketStream as AbstractUNIXSocketStream,
+    UDPPacket, UDPSocket as AbstractUDPSocket, ConnectedUDPSocket as AbstractConnectedUDPSocket,
+    TCPListener as AbstractTCPListener, UNIXListener as AbstractUNIXListener
+)
+from ..abc.streams import ByteStream, MessageStream
+from ..abc.synchronization import (
+    Lock as AbstractLock, Condition as AbstractCondition, Event as AbstractEvent,
+    Semaphore as AbstractSemaphore, CapacityLimiter as AbstractCapacityLimiter)
+from ..abc.tasks import CancelScope as AbstractCancelScope, TaskGroup as AbstractTaskGroup
 from ..exceptions import (
-    ExceptionGroup as BaseExceptionGroup, ClosedResourceError, ResourceBusyError, WouldBlock)
-from .._networking import BaseSocket
+    ExceptionGroup as BaseExceptionGroup, WouldBlock, ClosedResourceError, BusyResourceError)
 
 try:
     from asyncio import create_task, get_running_loop, current_task, all_tasks
@@ -76,10 +86,6 @@ def run(func: Callable[..., T_Retval], *args, debug: bool = False, use_uvloop: b
             pass
         else:
             policy = uvloop.EventLoopPolicy()
-
-    # Must be explicitly set on Python 3.8 for now or wait_socket_(readable|writable) won't work
-    if policy is None and sys.platform == 'win32' and sys.version_info >= (3, 8):
-        policy = asyncio.WindowsSelectorEventLoopPolicy()  # type: ignore
 
     if policy is not None:
         asyncio.set_event_loop_policy(policy)
@@ -236,7 +242,7 @@ class CancelScope:
         return self._shield
 
 
-abc.CancelScope.register(CancelScope)
+AbstractCancelScope.register(CancelScope)
 
 
 def check_cancelled():
@@ -400,7 +406,7 @@ class TaskGroup:
         self.cancel_scope._tasks.add(task)
 
 
-abc.TaskGroup.register(TaskGroup)
+AbstractTaskGroup.register(TaskGroup)
 
 
 #
@@ -530,89 +536,231 @@ async def aopen(*args, **kwargs):
 # Sockets and networking
 #
 
-_read_events = {}  # type: Dict[socket.SocketType, asyncio.Event]
-_write_events = {}  # type: Dict[socket.SocketType, asyncio.Event]
+@attr.s(slots=True, auto_attribs=True)
+class StreamMixin:
+    raw_socket: socket.SocketType
+    _loop: asyncio.AbstractEventLoop
+    _receiver_task: Optional[asyncio.Task] = None
+    _sender_task: Optional[asyncio.Task] = None
 
+    async def aclose(self) -> None:
+        self.raw_socket.close()
+        if self._receiver_task:
+            self._receiver_task.cancel()
+        if self._sender_task:
+            self._sender_task.cancel()
 
-class Socket(BaseSocket):
-    __slots__ = '_loop', '_read_event', '_write_event'
-
-    def __init__(self, raw_socket: socket.SocketType) -> None:
-        super().__init__(raw_socket)
-        self._loop = get_running_loop()
-        self._read_event = asyncio.Event()
-        self._write_event = asyncio.Event()
-
-    def _wait_readable(self):
-        return wait_socket_readable(self._raw_socket)
-
-    def _wait_writable(self):
-        return wait_socket_writable(self._raw_socket)
-
-    def _notify_close(self):
-        return notify_socket_close(self._raw_socket)
-
-    async def _check_cancelled(self) -> None:
+    async def receive(self, max_bytes: Optional[int] = None) -> bytes:
         check_cancelled()
+        if self.raw_socket.fileno() < 0:
+            raise ClosedResourceError
+        if self._receiver_task:
+            raise BusyResourceError('receiving from')
 
-    def _run_in_thread(self, func: Callable, *args):
-        return run_in_thread(func, *args)
+        self._receiver_task = current_task()
+        try:
+            return await self._loop.sock_recv(self.raw_socket, max_bytes or 65536)
+        except asyncio.CancelledError:
+            if self.raw_socket.fileno() < 0:
+                raise ClosedResourceError from None
+            else:
+                raise
+        except (ConnectionResetError, OSError) as exc:
+            self.raw_socket.close()
+            raise ClosedResourceError from exc
+        finally:
+            self._receiver_task = None
+
+    async def send(self, item: bytes) -> None:
+        check_cancelled()
+        if self.raw_socket.fileno() < 0:
+            raise ClosedResourceError
+        if self._sender_task:
+            raise BusyResourceError('sending from')
+
+        self._sender_task = current_task()
+        try:
+            await self._loop.sock_sendall(self.raw_socket, item)
+        except asyncio.CancelledError:
+            if self.raw_socket.fileno() < 0:
+                raise ClosedResourceError from None
+            else:
+                raise
+        except (ConnectionResetError, OSError) as exc:
+            self.raw_socket.close()
+            raise ClosedResourceError from exc
+        finally:
+            self._sender_task = None
 
 
-async def wait_socket_readable(sock: socket.SocketType) -> None:
-    check_cancelled()
-    if _read_events.get(sock):
-        raise ResourceBusyError('reading from') from None
+@attr.s(slots=True, auto_attribs=True)
+class ListenerMixin:
+    stream_class: ClassVar[Type[ByteStream]]
+    raw_socket: socket.SocketType
+    _loop: asyncio.AbstractEventLoop
+    _accepter_task: Optional[asyncio.Task] = None
 
+    async def aclose(self):
+        self.raw_socket.close()
+        if self._accepter_task:
+            self._accepter_task.cancel()
+
+    async def accept(self) -> socket.SocketType:
+        check_cancelled()
+        if self.raw_socket.fileno() < 0:
+            raise ClosedResourceError
+        if self._accepter_task:
+            raise BusyResourceError('accepting connections from')
+
+        self._accepter_task = current_task()
+        try:
+            raw_socket, address = await self._loop.sock_accept(self.raw_socket)
+        except CancelledError:
+            if self.raw_socket.fileno() < 0:
+                raise ClosedResourceError from None
+            else:
+                raise
+        finally:
+            self._accepter_task = None
+
+        raw_socket.setblocking(False)
+        return self.stream_class(raw_socket=raw_socket, loop=self._loop)
+
+
+@attr.s(slots=True, auto_attribs=True)
+class TCPSocketStream(StreamMixin, AbstractTCPSocketStream):
+    async def send_eof(self) -> None:
+        self.raw_socket.shutdown(socket.SHUT_WR)
+
+
+async def connect_tcp(raw_socket: socket.SocketType, remote_address) -> AbstractTCPSocketStream:
     loop = get_running_loop()
-    event = _read_events[sock] = asyncio.Event()
-    get_running_loop().add_reader(sock, event.set)
+    await loop.sock_connect(raw_socket, remote_address)
+    return TCPSocketStream(raw_socket=raw_socket, loop=loop)
+
+
+class TCPListener(ListenerMixin, AbstractTCPListener):
+    stream_class = TCPSocketStream
+
+
+async def create_tcp_listener(raw_socket: socket.SocketType) -> AbstractTCPListener:
+    return TCPListener(raw_socket, get_running_loop())
+
+
+@attr.s(slots=True, auto_attribs=True)
+class UNIXSocketStream(StreamMixin, AbstractUNIXSocketStream):
+    async def send_eof(self) -> None:
+        self.raw_socket.shutdown(socket.SHUT_WR)
+
+
+async def connect_unix(raw_socket: socket.SocketType,
+                       remote_address: str) -> AbstractUNIXSocketStream:
+    loop = get_running_loop()
+    await loop.sock_connect(raw_socket, remote_address)
+    return UNIXSocketStream(raw_socket=raw_socket, loop=loop)
+
+
+class UNIXListener(ListenerMixin, AbstractUNIXListener):
+    stream_class = UNIXSocketStream
+
+
+async def create_unix_listener(raw_socket: socket.SocketType) -> AbstractUNIXListener:
+    return UNIXListener(raw_socket, get_running_loop())
+
+
+@attr.s(slots=True, auto_attribs=True)
+class AsyncioUDPProtocol(asyncio.DatagramProtocol):
+    write_event: asyncio.Event = attr.ib(factory=asyncio.Event)
+    read_queue: asyncio.Queue = attr.ib(factory=lambda: asyncio.Queue(100))
+
+    def __attrs_post_init__(self):
+        self.write_event.set()
+
+    def datagram_received(self, data: Union[bytes, Text], addr: Tuple[str, int]) -> None:
+        try:
+            self.read_queue.put_nowait(UDPPacket(data, addr))
+        except asyncio.QueueFull:
+            pass
+
+    def connection_lost(self, exc: Optional[Exception]) -> None:
+        self.write_event.set()
+        if not self.read_queue.full():
+            self.read_queue.put_nowait(None)
+
+    def pause_writing(self) -> None:
+        self.write_event.clear()
+
+    def resume_writing(self) -> None:
+        self.write_event.set()
+
+
+@attr.s(slots=True, auto_attribs=True)
+class UDPSocket(AbstractUDPSocket):
+    raw_socket: socket.SocketType
+    _transport: asyncio.DatagramTransport
+    _protocol: AsyncioUDPProtocol
+    _receiver_task: Optional[asyncio.Task] = None
+    _sender_task: Optional[asyncio.Task] = None
+
+    async def aclose(self) -> None:
+        self._transport.close()
+        if self._receiver_task:
+            self._receiver_task.cancel()
+        if self._sender_task:
+            self._sender_task.cancel()
+
+    async def receive(self) -> UDPPacket:
+        check_cancelled()
+        if self._transport.is_closing():
+            raise ClosedResourceError
+        if self._receiver_task:
+            raise BusyResourceError('receiving from')
+
+        self._receiver_task = current_task()
+        try:
+            packet = await self._protocol.read_queue.get()
+            if self._transport.is_closing():
+                raise ClosedResourceError
+            else:
+                return packet
+        finally:
+            self._receiver_task = None
+
+    async def send(self, item: UDPPacket) -> None:
+        check_cancelled()
+        if self._transport.is_closing():
+            raise ClosedResourceError
+        if self._sender_task:
+            raise BusyResourceError('sending from')
+
+        self._sender_task = current_task()
+        try:
+            await self._protocol.write_event.wait()
+            if self._transport.is_closing():
+                raise ClosedResourceError
+            else:
+                self._transport.sendto(*item)
+        finally:
+            self._sender_task = None
+
+
+@attr.s(slots=True, auto_attribs=True)
+class ConnectedUDPSocket(StreamMixin, AbstractConnectedUDPSocket):
+    async def receive(self) -> bytes:
+        return await super().receive(65536)
+
+
+async def create_udp_socket(raw_socket: socket.SocketType) -> Union[AbstractUDPSocket,
+                                                                    AbstractConnectedUDPSocket]:
+    loop = get_running_loop()
     try:
-        await event.wait()
-    finally:
-        if _read_events.pop(sock, None) is not None:
-            loop.remove_reader(sock)
-            readable = True
-        else:
-            readable = False
-
-    if not readable:
-        raise ClosedResourceError
-
-
-async def wait_socket_writable(sock: socket.SocketType) -> None:
-    check_cancelled()
-    if _write_events.get(sock):
-        raise ResourceBusyError('writing to') from None
-
-    loop = get_running_loop()
-    event = _write_events[sock] = asyncio.Event()
-    loop.add_writer(sock.fileno(), event.set)
-    try:
-        await event.wait()
-    finally:
-        if _write_events.pop(sock, None) is not None:
-            loop.remove_writer(sock)
-            writable = True
-        else:
-            writable = False
-
-    if not writable:
-        raise ClosedResourceError
-
-
-async def notify_socket_close(sock: socket.SocketType) -> None:
-    loop = get_running_loop()
-
-    event = _read_events.pop(sock, None)
-    if event is not None:
-        loop.remove_reader(sock)
-        event.set()
-
-    event = _write_events.pop(sock, None)
-    if event is not None:
-        loop.remove_writer(sock)
-        event.set()
+        raw_socket.getpeername()
+    except OSError:
+        transport, protocol = await loop.create_datagram_endpoint(AsyncioUDPProtocol,
+                                                                  sock=raw_socket)
+        return UDPSocket(raw_socket, transport, protocol)
+    else:
+        return ConnectedUDPSocket(raw_socket, loop)
 
 
 #
@@ -661,23 +809,6 @@ class Semaphore(asyncio.Semaphore):
     @property
     def value(self):
         return self._value
-
-
-class Queue(asyncio.Queue):
-    def get(self):
-        check_cancelled()
-        return super().get()
-
-    def put(self, item):
-        check_cancelled()
-        return super().put(item)
-
-    def __aiter__(self):
-        return self
-
-    def __anext__(self):
-        check_cancelled()
-        return super().get()
 
 
 class CapacityLimiter:
@@ -773,18 +904,64 @@ class CapacityLimiter:
             event.set()
 
 
+@attr.s(auto_attribs=True, slots=True)
+class MemoryMessageStream(Generic[T_Item], MessageStream[T_Item]):
+    _closed: bool = attr.ib(init=False, default=False)
+    _send_event: asyncio.Event = attr.ib(init=False, factory=asyncio.Event)
+    _receive_events: Dict[asyncio.Event, List[T_Item]] = attr.ib(init=False, factory=OrderedDict)
+
+    async def receive(self) -> T_Item:
+        check_cancelled()
+        if self._closed:
+            raise ClosedResourceError
+
+        event = asyncio.Event()
+        container: List[T_Item] = []
+        self._receive_events[event] = container
+        self._send_event.set()
+        try:
+            await event.wait()
+        except BaseException:
+            self._receive_events.pop(event, None)
+            raise
+
+        try:
+            return container[0]
+        except IndexError:
+            raise ClosedResourceError from None
+
+    async def send(self, item: T_Item) -> None:
+        check_cancelled()
+        if self._closed:
+            raise ClosedResourceError
+
+        # Wait until there's someone on the receiving end
+        if not self._receive_events:
+            self._send_event.clear()
+            await self._send_event.wait()
+
+        # Send the item to the first recipient in the line
+        event, container = self._receive_events.popitem()
+        container.append(item)
+        event.set()
+
+    async def aclose(self) -> None:
+        self._closed = True
+        for event in self._receive_events:
+            event.set()
+
+
 def current_default_thread_limiter():
     return _default_thread_limiter
 
 
 _default_thread_limiter = CapacityLimiter(40)
 
-abc.Lock.register(Lock)
-abc.Condition.register(Condition)
-abc.Event.register(Event)
-abc.Semaphore.register(Semaphore)
-abc.Queue.register(Queue)
-abc.CapacityLimiter.register(CapacityLimiter)
+AbstractLock.register(Lock)
+AbstractCondition.register(Condition)
+AbstractEvent.register(Event)
+AbstractSemaphore.register(Semaphore)
+AbstractCapacityLimiter.register(CapacityLimiter)
 
 
 #

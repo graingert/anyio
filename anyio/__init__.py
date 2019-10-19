@@ -1,27 +1,31 @@
 import os
 import socket
-import ssl
 import sys
 import threading
 import typing
 from contextlib import contextmanager
 from importlib import import_module
-from ipaddress import ip_address, IPv6Address
 from ssl import SSLContext
-from typing import TypeVar, Callable, Union, Optional, Awaitable, Coroutine, Any, Dict, List, Tuple
+from typing import (
+    overload, TypeVar, Callable, Union, Optional, Awaitable, Coroutine, Any, Dict, List, Type)
 
+import attr
 import sniffio
 
-from .abc import (  # noqa: F401
-    IPAddressType, CancelScope, UDPSocket, Lock, Condition, Event, Semaphore, Queue, TaskGroup,
-    Stream, SocketStreamServer, SocketStream, AsyncFile, CapacityLimiter)
-from . import _networking
+from ._utils import get_bind_address
+from .abc.streams import UnreliableReceiveMessageStream, MessageStream
+from .abc.synchronization import Lock, Condition, Event, Semaphore, CapacityLimiter
+from .abc.tasks import CancelScope, TaskGroup
+from .abc.networking import (
+    TCPSocketStream, UNIXSocketStream, UDPSocket, IPAddressType, TCPListener, UNIXListener)
+from .abc.files import AsyncFile
 
 BACKENDS = 'asyncio', 'curio', 'trio'
 IPPROTO_IPV6 = getattr(socket, 'IPPROTO_IPV6', 41)  # https://bugs.python.org/issue29515
 
-T_Retval = TypeVar('T_Retval', covariant=True)
+T_Retval = TypeVar('T_Retval')
 T_Agen = TypeVar('T_Agen')
+T_Item = TypeVar('T_Item')
 _local = threading.local()
 
 
@@ -294,7 +298,7 @@ async def connect_tcp(
     autostart_tls: bool = False, bind_host: Optional[IPAddressType] = None,
     bind_port: Optional[int] = None, tls_standard_compatible: bool = True,
     happy_eyeballs_delay: float = 0.25
-) -> SocketStream:
+) -> TCPSocketStream:
     """
     Connect to a host using the TCP protocol.
 
@@ -321,9 +325,9 @@ async def connect_tcp(
 
     """
     # Placed here due to https://github.com/python/mypy/issues/7057
-    stream = None  # type: Optional[SocketStream]
+    stream: Optional[TCPSocketStream] = None
 
-    async def try_connect(af: int, addr: str, event: Event):
+    async def try_connect(af: int, sa: tuple, event: Event):
         nonlocal stream
         try:
             raw_socket = socket.socket(af, socket.SOCK_STREAM)
@@ -332,64 +336,35 @@ async def connect_tcp(
             await event.set()
             return
 
-        sock = asynclib.Socket(raw_socket)
         try:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            raw_socket.setblocking(False)
+            raw_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             if interface is not None and bind_port is not None:
-                await sock.bind((interface, bind_port))
+                raw_socket.bind((interface, bind_port))
 
-            await sock.connect((addr, port))
+            stream = await asynclib.connect_tcp(raw_socket, sa)
         except OSError as exc:
             oserrors.append(exc)
-            await sock.close()
-            return
+            raw_socket.close()
         except BaseException:
-            await sock.close()
+            raw_socket.close()
             raise
-        else:
-            assert stream is None
-            stream = _networking.SocketStream(sock, ssl_context, target_host,
-                                              tls_standard_compatible)
         finally:
             await event.set()
 
     asynclib = _get_asynclib()
-    interface, family = None, 0  # type: Optional[str], int
+    interface: Optional[str] = None
+    family: int = 0
     if bind_host:
-        interface, family, _v6only = await _networking.get_bind_address(bind_host)
+        interface, family, _v6only = await get_bind_address(bind_host)
 
-    target_host = str(address)
-    try:
-        addr_obj = ip_address(address)
-    except ValueError:
-        # getaddrinfo() will raise an exception if name resolution fails
-        resolved = await run_in_thread(socket.getaddrinfo, target_host, port, family,
+    target_addrs = await run_in_thread(socket.getaddrinfo, address, port, family,
                                        socket.SOCK_STREAM, cancellable=True)
-
-        # Organize the list so that the first address is an IPv6 address (if available) and the
-        # second one is an IPv4 addresses. The rest can be in whatever order.
-        v6_found = v4_found = False
-        target_addrs = []  # type: List[Tuple[socket.AddressFamily, str]]
-        for af, *rest, sa in resolved:
-            if af == socket.AF_INET6 and not v6_found:
-                v6_found = True
-                target_addrs.insert(0, (af, sa[0]))
-            elif af == socket.AF_INET and not v4_found and v6_found:
-                v4_found = True
-                target_addrs.insert(1, (af, sa[0]))
-            else:
-                target_addrs.append((af, sa[0]))
-    else:
-        if isinstance(addr_obj, IPv6Address):
-            target_addrs = [(socket.AF_INET6, addr_obj.compressed)]
-        else:
-            target_addrs = [(socket.AF_INET, addr_obj.compressed)]
-
-    oserrors = []  # type: List[OSError]
+    oserrors: List[OSError] = []
     async with create_task_group() as tg:
-        for i, (af, addr) in enumerate(target_addrs):
+        for i, (af, *rest, sa) in enumerate(target_addrs):
             event = create_event()
-            await tg.spawn(try_connect, af, addr, event)
+            await tg.spawn(try_connect, af, sa, event)
             async with move_on_after(happy_eyeballs_delay):
                 await event.wait()
 
@@ -407,7 +382,7 @@ async def connect_tcp(
     return stream
 
 
-async def connect_unix(path: Union[str, 'os.PathLike']) -> SocketStream:
+async def connect_unix(path: Union[str, 'os.PathLike']) -> UNIXSocketStream:
     """
     Connect to the given UNIX socket.
 
@@ -418,12 +393,11 @@ async def connect_unix(path: Union[str, 'os.PathLike']) -> SocketStream:
 
     """
     raw_socket = socket.socket(socket.AF_UNIX)
-    sock = _get_asynclib().Socket(raw_socket)
+    raw_socket.setblocking(False)
     try:
-        await sock.connect(path)
-        return _networking.SocketStream(sock)
+        return await _get_asynclib().connect_unix(raw_socket, str(path))
     except BaseException:
-        await sock.close()
+        raw_socket.close()
         raise
 
 
@@ -431,7 +405,7 @@ async def create_tcp_server(
     port: int = 0, interface: Optional[IPAddressType] = None,
     ssl_context: Optional[SSLContext] = None, autostart_tls: bool = True,
     tls_standard_compatible: bool = True,
-) -> SocketStreamServer:
+) -> TCPListener:
     """
     Start a TCP socket server.
 
@@ -450,31 +424,31 @@ async def create_tcp_server(
     :return: a server object
 
     """
-    interface, family, v6only = await _networking.get_bind_address(interface)
+    interface, family, v6only = await get_bind_address(interface)
     raw_socket = socket.socket(family)
+    raw_socket.setblocking(False)
+    raw_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     # Enable/disable dual stack operation as needed
     if family == socket.AF_INET6:
         raw_socket.setsockopt(IPPROTO_IPV6, socket.IPV6_V6ONLY, v6only)
 
-    sock = _get_asynclib().Socket(raw_socket)
     try:
         if sys.platform == 'win32':
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            raw_socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         else:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            raw_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-        await sock.bind((interface or '', port))
-        sock.listen()
-        return _networking.SocketStreamServer(sock, ssl_context, autostart_tls,
-                                              tls_standard_compatible)
+        raw_socket.bind((interface or '', port))
+        raw_socket.listen()
+        return await _get_asynclib().create_tcp_listener(raw_socket)
     except BaseException:
-        await sock.close()
+        raw_socket.close()
         raise
 
 
-async def create_unix_server(
-        path: Union[str, 'os.PathLike'], *, mode: Optional[int] = None) -> SocketStreamServer:
+async def create_unix_server(path: Union[str, 'os.PathLike'], *,
+                             mode: Optional[int] = None) -> UNIXListener:
     """
     Start a UNIX socket server.
 
@@ -486,17 +460,17 @@ async def create_unix_server(
 
     """
     raw_socket = socket.socket(socket.AF_UNIX)
-    sock = _get_asynclib().Socket(raw_socket)
+    raw_socket.setblocking(False)
     try:
-        await sock.bind(path)
+        raw_socket.bind(str(path))
 
         if mode is not None:
             os.chmod(path, mode)
 
-        sock.listen()
-        return _networking.SocketStreamServer(sock, None, False, True)
+        raw_socket.listen()
+        return await _get_asynclib().create_unix_listener(raw_socket)
     except BaseException:
-        await sock.close()
+        raw_socket.close()
         raise
 
 
@@ -518,7 +492,7 @@ async def create_udp_socket(
 
     """
     if interface:
-        interface, family, _v6only = await _networking.get_bind_address(interface)
+        interface, family, _v6only = await get_bind_address(interface)
     else:
         interface, family = None, 0
 
@@ -531,46 +505,18 @@ async def create_udp_socket(
             raise ValueError('{!r} cannot be resolved to an IP address'.format(target_host))
 
     raw_socket = socket.socket(family=family, type=socket.SOCK_DGRAM)
-    sock = _get_asynclib().Socket(raw_socket)
+    raw_socket.setblocking(False)
     try:
         if interface is not None or port is not None:
-            await sock.bind((interface or '', port or 0))
+            raw_socket.bind((interface or '', port or 0))
 
         if target_host is not None and target_port is not None:
-            await sock.connect((target_host, target_port))
+            raw_socket.connect((target_host, target_port))
 
-        return _networking.UDPSocket(sock)
+        return await _get_asynclib().create_udp_socket(raw_socket)
     except BaseException:
-        await sock.close()
+        raw_socket.close()
         raise
-
-
-def wait_socket_readable(sock: Union[socket.SocketType, ssl.SSLSocket]) -> Awaitable[None]:
-    """
-    Wait until the given socket has data to be read.
-
-    :param sock: a socket object
-    :raises anyio.exceptions.ClosedResourceError: if the socket was closed while waiting for the
-        socket to become readable
-    :raises anyio.exceptions.ResourceBusyError: if another task is already waiting for the socket
-        to become readable
-
-    """
-    return _get_asynclib().wait_socket_readable(sock)
-
-
-def wait_socket_writable(sock: Union[socket.SocketType, ssl.SSLSocket]) -> Awaitable[None]:
-    """
-    Wait until the given socket can be written to.
-
-    :param sock: a socket object
-    :raises anyio.exceptions.ClosedResourceError: if the socket was closed while waiting for the
-        socket to become writable
-    :raises anyio.exceptions.ResourceBusyError: if another task is already waiting for the socket
-        to become writable
-
-    """
-    return _get_asynclib().wait_socket_writable(sock)
 
 
 def notify_socket_close(sock: socket.SocketType) -> Awaitable[None]:
@@ -632,17 +578,6 @@ def create_semaphore(value: int) -> Semaphore:
     return _get_asynclib().Semaphore(value)
 
 
-def create_queue(capacity: int) -> Queue:
-    """
-    Create an asynchronous queue.
-
-    :param capacity: maximum number of items the queue will be able to store (0 = infinite)
-    :return: a queue object
-
-    """
-    return _get_asynclib().Queue(capacity)
-
-
 def create_capacity_limiter(total_tokens: float) -> CapacityLimiter:
     """
     Create a capacity limiter.
@@ -655,17 +590,36 @@ def create_capacity_limiter(total_tokens: float) -> CapacityLimiter:
     return _get_asynclib().CapacityLimiter(total_tokens)
 
 
+@overload
+def create_memory_stream(cls: Type[T_Item]) -> MessageStream[T_Item]:
+    ...
+
+
+@overload
+def create_memory_stream() -> MessageStream[Any]:
+    ...
+
+
+def create_memory_stream(cls=None):
+    """
+    Creates an in-memory message stream.
+
+    :param cls: type of the objects passed in the stream (for static type checking; omit to allow
+        any type)
+    """
+    return _get_asynclib().MemoryMessageStream()
+
+
 #
 # Operating system signals
 #
 
-def receive_signals(*signals: int) -> 'typing.AsyncContextManager[typing.AsyncIterator[int]]':
+def receive_signals(*signals: int) -> UnreliableReceiveMessageStream[int]:
     """
     Start receiving operating system signals.
 
     :param signals: signals to receive (e.g. ``signal.SIGINT``)
-    :return: an asynchronous context manager for an asynchronous iterator which yields signal
-        numbers
+    :return: a stream of signal numbers
 
     .. warning:: Windows does not support signals natively so it is best to avoid relying on this
         in cross-platform applications.
@@ -678,24 +632,14 @@ def receive_signals(*signals: int) -> 'typing.AsyncContextManager[typing.AsyncIt
 # Testing and debugging
 #
 
+@attr.s(slots=True, frozen=True, auto_attribs=True, eq=False, hash=False)
 class TaskInfo:
-    """
-    Represents an asynchronous task.
+    """Represents an asynchronous task."""
 
-    :ivar int id: the unique identifier of the task
-    :ivar parent_id: the identifier of the parent task, if any
-    :vartype parent_id: Optional[int]
-    :ivar str name: the description of the task (if any)
-    :ivar ~collections.abc.Coroutine coro: the coroutine object of the task
-    """
-
-    __slots__ = 'id', 'parent_id', 'name', 'coro'
-
-    def __init__(self, id: int, parent_id: Optional[int], name: Optional[str], coro: Coroutine):
-        self.id = id
-        self.parent_id = parent_id
-        self.name = name
-        self.coro = coro
+    id: int  #: the unique identifier of the task
+    parent_id: Optional[int] = attr.ib(repr=False)  #: the identifier of the parent task, if any
+    name: Optional[str]  #: the description of the task (if any)
+    coro: Coroutine = attr.ib(repr=False)  #: the coroutine object of the task
 
     def __eq__(self, other):
         if isinstance(other, TaskInfo):
@@ -705,9 +649,6 @@ class TaskInfo:
 
     def __hash__(self):
         return hash(self.id)
-
-    def __repr__(self):
-        return '{}(id={self.id!r}, name={self.name!r})'.format(self.__class__.__name__, self=self)
 
 
 async def get_current_task() -> TaskInfo:
