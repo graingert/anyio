@@ -1,12 +1,13 @@
+import sys
 from abc import abstractmethod
 from typing import Generic, TypeVar, Union, Optional, Tuple, overload, Dict, List
 
 from . import AsyncResource
 from ..exceptions import ClosedResourceError
 
-try:
+if sys.version_info >= (3, 8):
     from typing import Literal
-except ImportError:
+else:
     from typing_extensions import Literal
 
 T_Item = TypeVar('T_Item')
@@ -138,7 +139,7 @@ AnyByteStream = Union[MessageStream[bytes], ByteStream]
 
 class TLSByteStream(ByteStream):
     @abstractmethod
-    def unwrap(self) -> Tuple[AnyByteStream, bytes]:
+    async def unwrap(self) -> Tuple[AnyByteStream, bytes]:
         """
         Do the closing handshake and return any bytes still left in the read buffer.
 
@@ -217,7 +218,7 @@ class TLSByteStream(ByteStream):
         """
 
     @overload
-    def getpeercert(self, binary_form: Literal[False]) -> Dict[str, Union[str, tuple]]:
+    def getpeercert(self, binary_form: Literal[False] = False) -> Dict[str, Union[str, tuple]]:
         ...
 
     @overload

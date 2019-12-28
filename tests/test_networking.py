@@ -581,7 +581,7 @@ class TestUDPSocket:
     async def test_unconnected_receive_packets(self, localhost):
         async def serve():
             async for packet in server:
-                await server.send((packet.data[::-1], packet.address))
+                await server.send(UDPPacket(packet.data[::-1], packet.address))
 
         async with await create_udp_socket(interface=localhost) as server:
             async with await create_udp_socket(interface=localhost) as client:

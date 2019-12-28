@@ -1,5 +1,6 @@
 import ssl
-from typing import AsyncIterable, Optional, Dict, Union, Callable, TypeVar, Tuple, List
+import sys
+from typing import AsyncIterable, Optional, Dict, Union, Callable, TypeVar, Tuple, List, overload
 
 import attr
 
@@ -9,6 +10,11 @@ from .abc.streams import (
     AnySendByteStream, AnyByteStream, TLSByteStream)
 from .exceptions import DelimiterNotFound, IncompleteRead, ClosedResourceError
 
+if sys.version_info >= (3, 8):
+    from typing import Literal
+else:
+    from typing_extensions import Literal
+
 T_Retval = TypeVar('T_Retval')
 
 
@@ -16,6 +22,9 @@ T_Retval = TypeVar('T_Retval')
 class BufferedByteReader(AsyncResource):
     stream: AnyReceiveByteStream
     _buffer: bytes = attr.ib(init=False, default=b'')
+
+    async def aclose(self) -> None:
+        await self.stream.aclose()
 
     @property
     def buffer(self) -> bytes:
@@ -168,7 +177,10 @@ class SendTextStream(SendMessageStream[str]):
         try:
             data = item.encode(self.encoding)
         except UnicodeEncodeError:
-            data = item.encode(self.fallback_encoding)
+            if self.fallback_encoding:
+                data = item.encode(self.fallback_encoding)
+            else:
+                raise
 
         await self.stream.send(data + self.delimiter)
 
@@ -182,7 +194,7 @@ class TextStream(MessageStream[str]):
         self._stream = stream
         self.receive_stream = ReceiveTextStream(stream, delimiter, encoding, errors,
                                                 fallback_encoding, max_chunk_size)
-        self.send_stream = SendTextStream(stream, delimiter, encoding, fallback_encoding)
+        self.send_stream = SendTextStream(stream, delimiter, encoding, errors, fallback_encoding)
 
     async def receive(self) -> str:
         return await self.receive_stream.receive()
@@ -283,16 +295,16 @@ class TLSWrapperStream(TLSByteStream):
     def alpn_protocol(self) -> Optional[str]:
         return self._ssl_object.selected_alpn_protocol()  # type: ignore
 
-    def get_channel_binding(self, cb_type: str = 'tls-unique') -> Optional[bytes]:
-        return self._ssl_object.get_channel_binding(cb_type)
+    def get_channel_binding(self, cb_type: str = 'tls-unique') -> bytes:
+        return self._ssl_object.get_channel_binding(cb_type)  # type: ignore
 
     @property
     def tls_version(self) -> str:
         return self._ssl_object.version()  # type: ignore
 
     @property
-    def cipher(self) -> Tuple[str, int, int]:
-        return self._ssl_object.cipher()
+    def cipher(self) -> Tuple[str, str, int]:
+        return self._ssl_object.cipher()  # type: ignore
 
     @property
     def shared_ciphers(self) -> List[Tuple[str, str, int]]:
@@ -305,6 +317,14 @@ class TLSWrapperStream(TLSByteStream):
     @property
     def server_side(self) -> bool:
         return self._ssl_object.server_side
+
+    @overload
+    def getpeercert(self, binary_form: Literal[False] = False) -> Dict[str, Union[str, tuple]]:
+        ...
+
+    @overload
+    def getpeercert(self, binary_form: Literal[True]) -> bytes:
+        ...
 
     def getpeercert(self, binary_form: bool = False) -> Union[Dict[str, Union[str, tuple]], bytes,
                                                               None]:

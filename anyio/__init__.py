@@ -5,7 +5,6 @@ import threading
 import typing
 from contextlib import contextmanager
 from importlib import import_module
-from ssl import SSLContext
 from typing import (
     overload, TypeVar, Callable, Union, Optional, Awaitable, Coroutine, Any, Dict, List, Type)
 
@@ -294,10 +293,8 @@ def aopen(file: Union[str, 'os.PathLike', int], mode: str = 'r', buffering: int 
 #
 
 async def connect_tcp(
-    address: IPAddressType, port: int, *, ssl_context: Optional[SSLContext] = None,
-    autostart_tls: bool = False, bind_host: Optional[IPAddressType] = None,
-    bind_port: Optional[int] = None, tls_standard_compatible: bool = True,
-    happy_eyeballs_delay: float = 0.25
+    address: IPAddressType, port: int, *, bind_host: Optional[IPAddressType] = None,
+    bind_port: Optional[int] = None, happy_eyeballs_delay: float = 0.25
 ) -> TCPSocketStream:
     """
     Connect to a host using the TCP protocol.
@@ -310,15 +307,8 @@ async def connect_tcp(
 
     :param address: the IP address or host name to connect to
     :param port: port on the target host to connect to
-    :param ssl_context: default SSL context to use for TLS handshakes
-    :param autostart_tls: ``True`` to do a TLS handshake on connect
     :param bind_host: the interface address or name to bind the socket to before connecting
     :param bind_port: the port to bind the socket to before connecting
-    :param tls_standard_compatible: If ``True``, performs the TLS shutdown handshake before closing
-        the stream and requires that the server does this as well. Otherwise,
-        :exc:`~ssl.SSLEOFError` may be raised during reads from the stream.
-        Some protocols, such as HTTP, require this option to be ``False``.
-        See :meth:`~ssl.SSLContext.wrap_socket` for details.
     :param happy_eyeballs_delay: delay (in seconds) before starting the next connection attempt
     :return: a socket stream object
     :raises OSError: if the connection attempt fails
@@ -376,9 +366,6 @@ async def connect_tcp(
         cause = oserrors[0] if len(oserrors) == 1 else asynclib.ExceptionGroup(oserrors)
         raise OSError('All connection attempts failed') from cause
 
-    if autostart_tls:
-        await stream.start_tls()
-
     return stream
 
 
@@ -401,11 +388,8 @@ async def connect_unix(path: Union[str, 'os.PathLike']) -> UNIXSocketStream:
         raise
 
 
-async def create_tcp_server(
-    port: int = 0, interface: Optional[IPAddressType] = None,
-    ssl_context: Optional[SSLContext] = None, autostart_tls: bool = True,
-    tls_standard_compatible: bool = True,
-) -> TCPListener:
+async def create_tcp_server(port: int = 0,
+                            interface: Optional[IPAddressType] = None) -> TCPListener:
     """
     Start a TCP socket server.
 
@@ -632,7 +616,7 @@ def receive_signals(*signals: int) -> UnreliableReceiveMessageStream[int]:
 # Testing and debugging
 #
 
-@attr.s(slots=True, frozen=True, auto_attribs=True, eq=False, hash=False)
+@attr.s(slots=True, frozen=True, auto_attribs=True, eq=False, hash=False)  # type: ignore
 class TaskInfo:
     """Represents an asynchronous task."""
 

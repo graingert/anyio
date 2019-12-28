@@ -485,7 +485,7 @@ class ListenerMixin:
         if self._accepter_task:
             await self._accepter_task.cancel(exc=ClosedResourceError)
 
-    async def accept(self) -> socket.SocketType:
+    async def accept(self):
         await check_cancelled()
         if self.raw_socket.fileno() < 0:
             raise ClosedResourceError

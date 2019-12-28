@@ -1,6 +1,5 @@
 import asyncio
 import concurrent.futures
-import inspect
 import math
 import os
 import socket
@@ -10,7 +9,7 @@ from functools import partial
 from threading import Thread
 from typing import (
     Callable, Set, Optional, Union, Tuple, cast, Coroutine, Any, Awaitable, TypeVar, Generator,
-    List, Dict, Sequence, Text, ClassVar, Generic, Type)
+    List, Dict, Sequence, ClassVar, Generic, Type)
 from weakref import WeakKeyDictionary
 
 import attr
@@ -35,7 +34,8 @@ try:
 except ImportError:
     _T = TypeVar('_T')
 
-    def create_task(coro: Union[Generator[Any, None, _T], Awaitable[_T]]) -> asyncio.Task:
+    def create_task(coro: Union[Generator[Any, None, _T], Awaitable[_T]], *,
+                    name: Optional[str] = None) -> asyncio.Task:
         return get_running_loop().create_task(coro)
 
     def get_running_loop() -> asyncio.AbstractEventLoop:
@@ -60,8 +60,7 @@ except ImportError:
 
         return asyncio.Task.current_task(loop)
 
-# Check whether there is native support for task names in asyncio (3.8+)
-_native_task_names = 'name' in inspect.signature(create_task).parameters
+_native_task_names = sys.version_info >= (3, 8)
 
 
 #
@@ -395,7 +394,7 @@ class TaskGroup:
         if not self._active:
             raise RuntimeError('This task group is not active; no new tasks can be spawned.')
 
-        if _native_task_names is None:
+        if _native_task_names:
             task = create_task(self._run_wrapped_task(func, args), name=name)  # type: ignore
         else:
             task = create_task(self._run_wrapped_task(func, args))
@@ -605,7 +604,7 @@ class ListenerMixin:
         if self._accepter_task:
             self._accepter_task.cancel()
 
-    async def accept(self) -> socket.SocketType:
+    async def accept(self):
         check_cancelled()
         if self.raw_socket.fileno() < 0:
             raise ClosedResourceError
@@ -676,7 +675,7 @@ class AsyncioUDPProtocol(asyncio.DatagramProtocol):
     def __attrs_post_init__(self):
         self.write_event.set()
 
-    def datagram_received(self, data: Union[bytes, Text], addr: Tuple[str, int]) -> None:
+    def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:  # type: ignore
         try:
             self.read_queue.put_nowait(UDPPacket(data, addr))
         except asyncio.QueueFull:
@@ -739,14 +738,14 @@ class UDPSocket(AbstractUDPSocket):
             if self._transport.is_closing():
                 raise ClosedResourceError
             else:
-                self._transport.sendto(*item)
+                self._transport.sendto(item.data, item.address[:2])
         finally:
             self._sender_task = None
 
 
 @attr.s(slots=True, auto_attribs=True)
 class ConnectedUDPSocket(StreamMixin, AbstractConnectedUDPSocket):
-    async def receive(self) -> bytes:
+    async def receive(self, max_bytes: Optional[int] = None) -> bytes:
         return await super().receive(65536)
 
 
@@ -758,7 +757,7 @@ async def create_udp_socket(raw_socket: socket.SocketType) -> Union[AbstractUDPS
     except OSError:
         transport, protocol = await loop.create_datagram_endpoint(AsyncioUDPProtocol,
                                                                   sock=raw_socket)
-        return UDPSocket(raw_socket, transport, protocol)
+        return UDPSocket(raw_socket, transport, protocol)  # type: ignore
     else:
         return ConnectedUDPSocket(raw_socket, loop)
 

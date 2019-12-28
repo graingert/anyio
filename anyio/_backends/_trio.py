@@ -225,7 +225,7 @@ class ListenerMixin:
     async def aclose(self):
         self._trio_socket.close()
 
-    async def accept(self) -> ByteStream:
+    async def accept(self):
         try:
             trio_socket, address = await self._trio_socket.accept()
         except OSError as exc:
@@ -263,13 +263,7 @@ class UNIXListener(ListenerMixin, AbstractUNIXListener):
 
 async def connect_tcp(raw_socket: socket.SocketType,
                       remote_address: tuple) -> AbstractTCPSocketStream:
-    # try:
-    #     raw_socket.connect(remote_address)
-    # except
     trio_socket = trio.socket.from_stdlib_socket(raw_socket)
-    # from pdb import set_trace; set_trace()
-    # if remote_address == ('::1', 0, 0, 0):
-    #     from pdb import set_trace; set_trace()
     await trio_socket.connect(remote_address)
     return TCPSocketStream(raw_socket=raw_socket, trio_socket=trio_socket)
 
