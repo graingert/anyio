@@ -535,6 +535,24 @@ async def aopen(*args, **kwargs):
 # Sockets and networking
 #
 
+def _unregister_reader(raw_socket: socket.SocketType) -> None:
+    try:
+        remove_reader = get_running_loop().remove_reader
+    except AttributeError:
+        return  # proactor event loops don't have remove_reader()
+
+    remove_reader((raw_socket))
+
+
+def _unregister_writer(raw_socket: socket.SocketType) -> None:
+    try:
+        remove_writer = get_running_loop().remove_writer
+    except AttributeError:
+        return  # proactor event loops don't have remove_writer()
+
+    remove_writer(raw_socket)
+
+
 @attr.s(slots=True, auto_attribs=True)
 class StreamMixin:
     raw_socket: socket.SocketType
@@ -543,7 +561,11 @@ class StreamMixin:
     _sender_task: Optional[asyncio.Task] = None
 
     async def aclose(self) -> None:
-        self.raw_socket.close()
+        if self.raw_socket.fileno() >= 0:
+            _unregister_reader(self.raw_socket)
+            _unregister_writer(self.raw_socket)
+            self.raw_socket.close()
+
         if self._receiver_task:
             self._receiver_task.cancel()
         if self._sender_task:
@@ -563,6 +585,7 @@ class StreamMixin:
             if self.raw_socket.fileno() < 0:
                 raise ClosedResourceError from None
             else:
+                _unregister_reader(self.raw_socket)
                 raise
         except (ConnectionResetError, OSError) as exc:
             self.raw_socket.close()
@@ -584,6 +607,7 @@ class StreamMixin:
             if self.raw_socket.fileno() < 0:
                 raise ClosedResourceError from None
             else:
+                _unregister_writer(self.raw_socket)
                 raise
         except (ConnectionResetError, OSError) as exc:
             self.raw_socket.close()
@@ -600,7 +624,10 @@ class ListenerMixin:
     _accepter_task: Optional[asyncio.Task] = None
 
     async def aclose(self):
-        self.raw_socket.close()
+        if self.raw_socket.fileno() >= 0:
+            _unregister_reader(self.raw_socket)
+            self.raw_socket.close()
+
         if self._accepter_task:
             self._accepter_task.cancel()
 
@@ -618,6 +645,7 @@ class ListenerMixin:
             if self.raw_socket.fileno() < 0:
                 raise ClosedResourceError from None
             else:
+                _unregister_reader(self.raw_socket)
                 raise
         finally:
             self._accepter_task = None
@@ -634,7 +662,12 @@ class TCPSocketStream(StreamMixin, AbstractTCPSocketStream):
 
 async def connect_tcp(raw_socket: socket.SocketType, remote_address) -> AbstractTCPSocketStream:
     loop = get_running_loop()
-    await loop.sock_connect(raw_socket, remote_address)
+    try:
+        await loop.sock_connect(raw_socket, remote_address)
+    except asyncio.CancelledError:
+        _unregister_writer(raw_socket)
+        raise
+
     return TCPSocketStream(raw_socket=raw_socket, loop=loop)
 
 
@@ -655,7 +688,12 @@ class UNIXSocketStream(StreamMixin, AbstractUNIXSocketStream):
 async def connect_unix(raw_socket: socket.SocketType,
                        remote_address: str) -> AbstractUNIXSocketStream:
     loop = get_running_loop()
-    await loop.sock_connect(raw_socket, remote_address)
+    try:
+        await loop.sock_connect(raw_socket, remote_address)
+    except asyncio.CancelledError:
+        _unregister_writer(raw_socket)
+        raise
+
     return UNIXSocketStream(raw_socket=raw_socket, loop=loop)
 
 
