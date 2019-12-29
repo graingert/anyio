@@ -6,7 +6,7 @@ import pytest
 
 from anyio import (
     create_task_group, connect_tcp, create_udp_socket, connect_unix, create_unix_server,
-    create_tcp_server, wait_all_tasks_blocked)
+    create_tcp_server, wait_all_tasks_blocked, sleep)
 from anyio.abc.networking import UDPPacket
 from anyio.abc.streams import Listener
 from anyio.exceptions import (
@@ -265,8 +265,8 @@ def fake_localhost_dns(monkeypatch):
 class BaseSocketStreamTest(metaclass=ABCMeta):
     @classmethod
     async def serve(cls, listener: Listener):
-        async for _ in listener:
-            pass
+        async with await listener.accept() as stream:  # noqa: F841
+            await sleep(10)
 
     @pytest.fixture(params=[False, True], ids=['string', 'path'])
     def local_address(self, request, tmp_path_factory):
@@ -369,12 +369,16 @@ class BaseSocketStreamTest(metaclass=ABCMeta):
         ClosedResourceError being raised.
 
         """
+        async def send_loop():
+            while True:
+                await client.send(b'\x00' * 1024_000)
+
         async with await self.create_server(local_address) as listener:
             with pytest.raises(ClosedResourceError):
                 async with create_task_group() as tg:
                     await tg.spawn(self.serve, listener)
                     client = await self.connect_client(local_address)
-                    await tg.spawn(client.send, b'\x00' * 1024_0000)
+                    await tg.spawn(send_loop)
                     await wait_all_tasks_blocked()
                     await client.aclose()
 
@@ -620,13 +624,13 @@ class TestUDPSocket:
         """
         target_host, target_port = (localhost, 9999) if connect else (None, None)
         payload = b'data' if connect else UDPPacket(b'data', (localhost, 9999))
-        async with await create_udp_socket(interface=localhost, target_host=target_host,
-                                           target_port=target_port) as receiver:
-            await receiver.aclose()
-            with pytest.raises(ClosedResourceError):
-                await receiver.receive()
-            with pytest.raises(ClosedResourceError):
-                await receiver.send(payload)
+        receiver = await create_udp_socket(interface=localhost, target_host=target_host,
+                                           target_port=target_port)
+        await receiver.aclose()
+        with pytest.raises(ClosedResourceError):
+            await receiver.receive()
+        with pytest.raises(ClosedResourceError):
+            await receiver.send(payload)
 
     @pytest.mark.parametrize('connect', [False, True], ids=['unconnected', 'connected'])
     @pytest.mark.anyio
