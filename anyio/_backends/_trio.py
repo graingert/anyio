@@ -229,7 +229,7 @@ class ListenerMixin:
         try:
             trio_socket, address = await self._trio_socket.accept()
         except OSError as exc:
-            if exc.errno == 9:
+            if exc.errno in (9, 10038):
                 raise ClosedResourceError from None
             else:
                 raise
