@@ -21,12 +21,8 @@ def localhost():
 @pytest.fixture
 def fake_localhost_dns(monkeypatch):
     # Make it return IPv4 addresses first so we can test the IPv6 preference
-    def fake_getaddrinfo(host, *args):
-        if host == 'localhost':
-            return [(socket.AF_INET, socket.SOCK_STREAM, '', ('127.0.0.1', 0)),
-                    (socket.AF_INET6, socket.SOCK_STREAM, '', ('::1', 0, 0, 0))]
-
-        return real_getaddrinfo(host, *args)
+    def fake_getaddrinfo(*args):
+        return sorted(real_getaddrinfo(*args), key=lambda x: x[0])
 
     real_getaddrinfo = socket.getaddrinfo
     monkeypatch.setattr('socket.getaddrinfo', fake_getaddrinfo)
@@ -522,8 +518,8 @@ class TestTCPSocketStream(BaseSocketStreamTest):
         async with await self.create_server(local_address) as listener:
             client = await self.connect_client(local_address)
             async with await listener.accept() as connection:
-                assert client.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) == 1
-                assert connection.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) == 1
+                assert client.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) != 0
+                assert connection.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY) != 0
 
     @pytest.mark.anyio
     async def test_socket_creation_failure(self, monkeypatch):
@@ -581,6 +577,14 @@ class TestUNIXSocketStream(BaseSocketStreamTest):
 
 
 class TestUDPSocket:
+    @pytest.fixture
+    def localhost(self, anyio_backend):
+        if socket.has_ipv6 and sys.platform != 'win32' and anyio_backend != 'asyncio':
+            return '::1'
+        else:
+            # Due to https://bugs.python.org/issue39148
+            return '127.0.0.1'
+
     @pytest.mark.anyio
     async def test_unconnected_receive_packets(self, localhost):
         async def serve():

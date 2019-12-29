@@ -537,20 +537,16 @@ async def aopen(*args, **kwargs):
 
 def _unregister_reader(raw_socket: socket.SocketType) -> None:
     try:
-        remove_reader = get_running_loop().remove_reader
-    except AttributeError:
+        get_running_loop().remove_reader(raw_socket)
+    except NotImplementedError:
         return  # proactor event loops don't have remove_reader()
-
-    remove_reader((raw_socket))
 
 
 def _unregister_writer(raw_socket: socket.SocketType) -> None:
     try:
-        remove_writer = get_running_loop().remove_writer
-    except AttributeError:
+        get_running_loop().remove_writer(raw_socket)
+    except NotImplementedError:
         return  # proactor event loops don't have remove_writer()
-
-    remove_writer(raw_socket)
 
 
 @attr.s(slots=True, auto_attribs=True)
