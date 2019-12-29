@@ -12,10 +12,14 @@ from anyio.abc.streams import Listener
 from anyio.exceptions import (
     ClosedResourceError, BusyResourceError, ExceptionGroup)
 
-
-@pytest.fixture(scope='module')
-def localhost():
-    return '::1' if socket.has_ipv6 else '127.0.0.1'
+# Check if the OS (and not just Python itself) supports IPv6
+supports_ipv6 = False
+if socket.has_ipv6:
+    try:
+        socket.socket(socket.AF_INET6)
+        supports_ipv6 = True
+    except OSError:
+        pass
 
 
 @pytest.fixture
@@ -232,7 +236,7 @@ def fake_localhost_dns(monkeypatch):
 #                     finally:
 #                         await tg.cancel_scope.cancel()
 #
-#     @pytest.mark.skipif(not socket.has_ipv6, reason='IPv6 is not available')
+#     @pytest.mark.skipif(not supports_ipv6, reason='IPv6 is not available')
 #     @pytest.mark.parametrize('interface, expected_addr', [
 #         (None, b'::1'),
 #         ('127.0.0.1', b'127.0.0.1'),
@@ -489,7 +493,7 @@ class TestTCPSocketStream(BaseSocketStreamTest):
     @pytest.fixture(params=[
         pytest.param(socket.AF_INET, id='ipv4'),
         pytest.param(socket.AF_INET6, id='ipv6',
-                     marks=[pytest.mark.skipif(not socket.has_ipv6, reason='no IPv6 support')])
+                     marks=[pytest.mark.skipif(not supports_ipv6, reason='no IPv6 support')])
     ])
     def local_address(self, request):
         addr = '127.0.0.1' if request.param == socket.AF_INET else '::1'
@@ -537,7 +541,7 @@ class TestTCPSocketStream(BaseSocketStreamTest):
     @pytest.mark.parametrize('target, exception_class', [
         pytest.param(
             'localhost', ExceptionGroup,
-            marks=[pytest.mark.skipif(not socket.has_ipv6, reason='IPv6 is not available')]
+            marks=[pytest.mark.skipif(not supports_ipv6, reason='IPv6 is not available')]
         ),
         ('127.0.0.1', ConnectionRefusedError)
     ], ids=['multi', 'single'])
@@ -577,13 +581,17 @@ class TestUNIXSocketStream(BaseSocketStreamTest):
 
 
 class TestUDPSocket:
-    @pytest.fixture
-    def localhost(self, anyio_backend):
-        if socket.has_ipv6 and sys.platform != 'win32' and anyio_backend != 'asyncio':
-            return '::1'
-        else:
-            # Due to https://bugs.python.org/issue39148
-            return '127.0.0.1'
+    @pytest.fixture(params=[
+        pytest.param('127.0.0.1', id='ipv4'),
+        pytest.param('::1', id='ipv6')
+    ])
+    def localhost(self, request, anyio_backend):
+        if supports_ipv6:
+            if sys.platform == 'win32' and anyio_backend == 'asyncio':
+                if sys.version_info >= (3, 8):
+                    pytest.skip('Would hang due to https://bugs.python.org/issue39148')
+
+        return request.param
 
     @pytest.mark.anyio
     async def test_unconnected_receive_packets(self, localhost):
