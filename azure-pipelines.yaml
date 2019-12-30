@@ -67,6 +67,7 @@ stages:
       condition: succeededOrFailed()
       inputs:
         testResultsFiles: '$(System.DefaultWorkingDirectory)/junit.xml'
+        testResultsFormat: xUnit
 
     - script: coverage xml
       displayName: Generate coverage report
