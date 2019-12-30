@@ -17,7 +17,7 @@ stages:
     - script: flake8
       displayName: Run flake8
 
-    - script: mypy anyio
+    - script: mypy src
       displayName: Run mypy
 
 - stage: run_test_suite
