@@ -74,9 +74,6 @@ class TestTLSWrapper:
             unencrypted.send(b'unencrypted')
             unencrypted.close()
 
-        server_context.set_alpn_protocols(['dummy1', 'dummy2'])
-        client_context.set_alpn_protocols(['dummy2', 'dummy3'])
-
         server_sock = server_context.wrap_socket(socket.socket(), server_side=True,
                                                  suppress_ragged_eofs=False)
         server_sock.settimeout(1)
