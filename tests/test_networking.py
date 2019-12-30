@@ -21,6 +21,11 @@ if socket.has_ipv6:
     except OSError:
         pass
 
+localhost_has_ipv6 = False
+if supports_ipv6:
+    localhost_has_ipv6 = any(addr[0] == socket.AddressFamily.AF_INET6
+                             for addr in socket.getaddrinfo('localhost', 0))
+
 
 @pytest.fixture
 def fake_localhost_dns(monkeypatch):
@@ -540,11 +545,13 @@ class TestTCPSocketStream(BaseSocketStreamTest):
 
     @pytest.mark.parametrize('target, exception_class', [
         pytest.param(
-            'localhost', ExceptionGroup,
-            marks=[pytest.mark.skipif(not supports_ipv6, reason='IPv6 is not available')]
+            'localhost', ExceptionGroup, id='multi',
+            marks=[pytest.mark.skipif(not supports_ipv6, reason='IPv6 is not available'),
+                   pytest.mark.skipif(not localhost_has_ipv6,
+                                      reason='localhost does not resolve to an IPv6 address')]
         ),
-        ('127.0.0.1', ConnectionRefusedError)
-    ], ids=['multi', 'single'])
+        pytest.param('127.0.0.1', ConnectionRefusedError, id='single')
+    ])
     @pytest.mark.anyio
     async def test_connrefused(self, target, exception_class, fake_localhost_dns):
         dummy_socket = socket.socket(socket.AF_INET6)
