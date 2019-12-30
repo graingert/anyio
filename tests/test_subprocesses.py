@@ -56,10 +56,10 @@ async def test_terminate(tmp_path, anyio_backend):
     """))
     process = await open_process(['python', str(script_path)])
     buffered_stdout = BufferedByteReader(process.stdout)
-    line = await buffered_stdout.read_until(b'\n', 100)
+    line = await buffered_stdout.receive_until(b'\n', 100)
     assert line == b'ready'
 
     process.terminate()
-    line = await buffered_stdout.read_until(b'\n', 100)
+    line = await buffered_stdout.receive_until(b'\n', 100)
     assert line == b'exited with SIGTERM'
     assert await process.wait() == 0

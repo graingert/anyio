@@ -30,7 +30,7 @@ class BufferedByteReader(AsyncResource):
     def buffer(self) -> bytes:
         return self._buffer
 
-    async def read_exactly(self, nbytes: int) -> bytes:
+    async def receive_exactly(self, nbytes: int) -> bytes:
         """
         Read exactly the given amount of bytes from the stream.
 
@@ -53,7 +53,7 @@ class BufferedByteReader(AsyncResource):
         self._buffer = self._buffer[nbytes:]
         return result
 
-    async def read_until(self, delimiter: bytes, max_bytes: int) -> bytes:
+    async def receive_until(self, delimiter: bytes, max_bytes: int) -> bytes:
         """
         Read from the stream until the delimiter is found or max_bytes have been read.
 
@@ -90,25 +90,8 @@ class BufferedByteReader(AsyncResource):
             offset = max(len(self._buffer) - delimiter_size + 1, 0)
             self._buffer += data
 
-    async def read_chunks(self, max_size: int) -> AsyncIterable[bytes]:
-        """
-        Return an async iterable which yields chunks of bytes as soon as they are received.
-
-        The generator will yield new chunks until the stream is closed.
-
-        :param max_size: maximum number of bytes to return in one iteration
-        :return: an async iterable yielding bytes
-
-        """
-        while True:
-            data = await self.stream.receive()
-            if data:
-                yield data
-            else:
-                break
-
-    async def read_delimited_chunks(self, delimiter: bytes,
-                                    max_chunk_size: int) -> AsyncIterable[bytes]:
+    async def receive_delimited_chunks(self, delimiter: bytes,
+                                       max_chunk_size: int) -> AsyncIterable[bytes]:
         """
         Return an async iterable which yields chunks of bytes as soon as they are received.
 
@@ -123,7 +106,7 @@ class BufferedByteReader(AsyncResource):
         """
         while True:
             try:
-                chunk = await self.read_until(delimiter, max_chunk_size)
+                chunk = await self.receive_until(delimiter, max_chunk_size)
             except IncompleteRead:
                 if self._buffer:
                     raise
@@ -151,7 +134,7 @@ class ReceiveTextStream(ReceiveMessageStream[str]):
         await self.buffer.stream.aclose()
 
     async def receive(self) -> str:
-        line = await self.buffer.read_until(self.delimiter, self.max_chunk_size)
+        line = await self.buffer.receive_until(self.delimiter, self.max_chunk_size)
         try:
             return line.decode(self.encoding, errors=self.errors)
         except UnicodeDecodeError:
