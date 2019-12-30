@@ -59,7 +59,7 @@ stages:
     - script: pip install .[test,curio,trio]
       displayName: Install dependencies
 
-    - script: coverage run -m pytest --junit-xml=junit.xml --junit-family=xunit2
+    - script: coverage run -m pytest --junit-xml=junit.xml
       displayName: Run pytest
 
     - task: PublishTestResults@2
