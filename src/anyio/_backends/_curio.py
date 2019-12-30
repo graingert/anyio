@@ -14,6 +14,7 @@ import curio.io
 import curio.meta
 import curio.socket
 import curio.ssl
+import curio.subprocess
 import curio.traps
 from async_generator import async_generator, asynccontextmanager, yield_
 
@@ -23,7 +24,8 @@ from ..abc.networking import (
     UDPPacket, UDPSocket as AbstractUDPSocket, ConnectedUDPSocket as AbstractConnectedUDPSocket,
     TCPListener as AbstractTCPListener, UNIXListener as AbstractUNIXListener
 )
-from ..abc.streams import ByteStream, MessageStream
+from ..abc.streams import ByteStream, MessageStream, ReceiveByteStream, SendByteStream
+from ..abc.subprocesses import AsyncProcess as AbstractAsyncProcess
 from ..abc.synchronization import (
     Lock as AbstractLock, Condition as AbstractCondition, Event as AbstractEvent,
     Semaphore as AbstractSemaphore, CapacityLimiter as AbstractCapacityLimiter)
@@ -411,6 +413,79 @@ def run_async_from_thread(func: Callable[..., T_Retval], *args) -> T_Retval:
     future = Future()  # type: Future[T_Retval]
     _local.queue.put((func, args, future))
     return future.result()
+
+
+#
+# Stream wrappers
+#
+
+class FileStreamWrapper(ByteStream):
+    def __init__(self, stream: curio.io.FileStream):
+        super().__init__()
+        self._stream = stream
+
+    async def receive(self, max_bytes: Optional[int] = None) -> bytes:
+        return await self._stream.read(max_bytes or 65536)
+
+    async def send(self, item: bytes) -> None:
+        await self._stream.write(item)
+
+    async def aclose(self) -> None:
+        await self._stream.close()
+
+
+#
+# Subprocesses
+#
+
+@attr.s(slots=True, auto_attribs=True)
+class Process(AbstractAsyncProcess):
+    _process: curio.subprocess.Popen
+    _stdin: Optional[SendByteStream]
+    _stdout: Optional[ReceiveByteStream]
+    _stderr: Optional[ReceiveByteStream]
+
+    async def wait(self) -> int:
+        return await self._process.wait()
+
+    def terminate(self) -> None:
+        self._process.terminate()
+
+    def kill(self) -> None:
+        self._process.kill()
+
+    def send_signal(self, signal: int) -> None:
+        self._process.send_signal(signal)
+
+    @property
+    def pid(self) -> int:
+        return self._process.pid
+
+    @property
+    def returncode(self) -> Optional[int]:
+        return self._process.returncode
+
+    @property
+    def stdin(self) -> Optional[SendByteStream]:
+        return self._stdin
+
+    @property
+    def stdout(self) -> Optional[ReceiveByteStream]:
+        return self._stdout
+
+    @property
+    def stderr(self) -> Optional[ReceiveByteStream]:
+        return self._stderr
+
+
+async def open_process(command, *, shell: bool, stdin: int, stdout: int, stderr: int):
+    await check_cancelled()
+    process = curio.subprocess.Popen(command, stdin=stdin, stdout=stdout, stderr=stderr,
+                                     shell=shell)
+    stdin_stream = FileStreamWrapper(process.stdin) if process.stdin else None
+    stdout_stream = FileStreamWrapper(process.stdout) if process.stdout else None
+    stderr_stream = FileStreamWrapper(process.stderr) if process.stderr else None
+    return Process(process, stdin_stream, stdout_stream, stderr_stream)
 
 
 #

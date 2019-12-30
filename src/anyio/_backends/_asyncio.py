@@ -21,7 +21,8 @@ from ..abc.networking import (
     UDPPacket, UDPSocket as AbstractUDPSocket, ConnectedUDPSocket as AbstractConnectedUDPSocket,
     TCPListener as AbstractTCPListener, UNIXListener as AbstractUNIXListener
 )
-from ..abc.streams import ByteStream, MessageStream
+from ..abc.streams import ByteStream, MessageStream, ReceiveByteStream, SendByteStream
+from ..abc.subprocesses import AsyncProcess as AbstractAsyncProcess
 from ..abc.synchronization import (
     Lock as AbstractLock, Condition as AbstractCondition, Event as AbstractEvent,
     Semaphore as AbstractSemaphore, CapacityLimiter as AbstractCapacityLimiter)
@@ -458,6 +459,92 @@ def run_async_from_thread(func: Callable[..., Coroutine[Any, Any, T_Retval]], *a
     f = asyncio.run_coroutine_threadsafe(
         func(*args), _local.loop)  # type: concurrent.futures.Future[T_Retval]
     return f.result()
+
+
+#
+# Stream wrappers
+#
+
+@attr.s(slots=True, frozen=True, auto_attribs=True)
+class StreamReaderWrapper(ReceiveByteStream):
+    _stream: asyncio.StreamReader
+
+    async def receive(self, max_bytes: Optional[int] = None) -> bytes:
+        return await self._stream.read(max_bytes or 65536)
+
+    async def aclose(self) -> None:
+        self._stream.feed_eof()
+
+
+@attr.s(slots=True, frozen=True, auto_attribs=True)
+class StreamWriterWrapper(SendByteStream):
+    _stream: asyncio.StreamWriter
+
+    async def send(self, item: bytes) -> None:
+        self._stream.write(item)
+        await self._stream.drain()
+
+    async def aclose(self) -> None:
+        self._stream.close()
+
+
+#
+# Subprocesses
+#
+
+@attr.s(slots=True, auto_attribs=True)
+class Process(AbstractAsyncProcess):
+    _process: asyncio.subprocess.Process
+    _stdin: Optional[SendByteStream]
+    _stdout: Optional[ReceiveByteStream]
+    _stderr: Optional[ReceiveByteStream]
+
+    async def wait(self) -> int:
+        return await self._process.wait()
+
+    def terminate(self) -> None:
+        self._process.terminate()
+
+    def kill(self) -> None:
+        self._process.kill()
+
+    def send_signal(self, signal: int) -> None:
+        self._process.send_signal(signal)
+
+    @property
+    def pid(self) -> int:
+        return self._process.pid
+
+    @property
+    def returncode(self) -> Optional[int]:
+        return self._process.returncode
+
+    @property
+    def stdin(self) -> Optional[SendByteStream]:
+        return self._stdin
+
+    @property
+    def stdout(self) -> Optional[ReceiveByteStream]:
+        return self._stdout
+
+    @property
+    def stderr(self) -> Optional[ReceiveByteStream]:
+        return self._stderr
+
+
+async def open_process(command, *, shell: bool, stdin: int, stdout: int, stderr: int):
+    check_cancelled()
+    if shell:
+        process = await asyncio.create_subprocess_shell(command, stdin=stdin, stdout=stdout,
+                                                        stderr=stderr)
+    else:
+        process = await asyncio.create_subprocess_exec(*command, stdin=stdin, stdout=stdout,
+                                                       stderr=stderr)
+
+    stdin_stream = StreamWriterWrapper(process.stdin) if process.stdin else None
+    stdout_stream = StreamReaderWrapper(process.stdout) if process.stdout else None
+    stderr_stream = StreamReaderWrapper(process.stderr) if process.stderr else None
+    return Process(process, stdin_stream, stdout_stream, stderr_stream)
 
 
 #

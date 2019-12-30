@@ -14,11 +14,12 @@ from ..abc.networking import (
     UDPPacket, UDPSocket as AbstractUDPSocket, ConnectedUDPSocket as AbstractConnectedUDPSocket,
     TCPListener as AbstractTCPListener, UNIXListener as AbstractUNIXListener
 )
-from ..abc.streams import ByteStream
-from ..abc.tasks import CancelScope as AbstractCancelScope, TaskGroup as AbstractTaskGroup
+from ..abc.streams import ByteStream, ReceiveByteStream, SendByteStream
+from ..abc.subprocesses import AsyncProcess as AbstractAsyncProcess
 from ..abc.synchronization import (
     Lock as AbstractLock, Condition as AbstractCondition, Event as AbstractEvent,
     Semaphore as AbstractSemaphore, CapacityLimiter as AbstractCapacityLimiter)
+from ..abc.tasks import CancelScope as AbstractCancelScope, TaskGroup as AbstractTaskGroup
 from ..exceptions import (
     ExceptionGroup as BaseExceptionGroup, WouldBlock, ClosedResourceError, BusyResourceError)
 
@@ -165,6 +166,85 @@ async def run_in_thread(func: Callable[..., T_Retval], *args, cancellable: bool 
     return await run_sync(wrapper, cancellable=cancellable, limiter=trio_limiter)
 
 run_async_from_thread = trio.from_thread.run
+
+
+#
+# Stream wrappers
+#
+
+@attr.s(slots=True, frozen=True, auto_attribs=True)
+class ReceiveStreamWrapper(ReceiveByteStream):
+    _stream: trio.abc.ReceiveStream
+
+    async def receive(self, max_bytes: Optional[int] = None) -> bytes:
+        return await self._stream.receive_some(max_bytes)
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
+
+@attr.s(slots=True, frozen=True, auto_attribs=True)
+class SendStreamWrapper(SendByteStream):
+    _stream: trio.abc.SendStream
+
+    async def send(self, item: bytes) -> None:
+        await self._stream.send_all(item)
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
+
+#
+# Subprocesses
+#
+
+@attr.s(slots=True, auto_attribs=True)
+class Process(AbstractAsyncProcess):
+    _process: trio.Process
+    _stdin: Optional[SendByteStream]
+    _stdout: Optional[ReceiveByteStream]
+    _stderr: Optional[ReceiveByteStream]
+
+    async def wait(self) -> int:
+        return await self._process.wait()
+
+    def terminate(self) -> None:
+        self._process.terminate()
+
+    def kill(self) -> None:
+        self._process.kill()
+
+    def send_signal(self, signal: int) -> None:
+        self._process.send_signal(signal)
+
+    @property
+    def pid(self) -> int:
+        return self._process.pid
+
+    @property
+    def returncode(self) -> Optional[int]:
+        return self._process.returncode
+
+    @property
+    def stdin(self) -> Optional[SendByteStream]:
+        return self._stdin
+
+    @property
+    def stdout(self) -> Optional[ReceiveByteStream]:
+        return self._stdout
+
+    @property
+    def stderr(self) -> Optional[ReceiveByteStream]:
+        return self._stderr
+
+
+async def open_process(command, *, shell: bool, stdin: int, stdout: int, stderr: int):
+    process = await trio.open_process(command, stdin=stdin, stdout=stdout, stderr=stderr,
+                                      shell=shell)
+    stdin_stream = SendStreamWrapper(process.stdin) if process.stdin else None
+    stdout_stream = ReceiveStreamWrapper(process.stdout) if process.stdout else None
+    stderr_stream = ReceiveStreamWrapper(process.stderr) if process.stderr else None
+    return Process(process, stdin_stream, stdout_stream, stderr_stream)
 
 
 #
