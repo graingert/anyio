@@ -6,6 +6,7 @@ import typing
 from contextlib import contextmanager
 from importlib import import_module
 from subprocess import CompletedProcess, PIPE, DEVNULL, CalledProcessError
+from types import FrameType, CoroutineType, GeneratorType
 from typing import (
     overload, TypeVar, Callable, Union, Optional, Awaitable, Coroutine, Any, Dict, List, Type,
     Sequence)
@@ -700,7 +701,35 @@ class TaskInfo:
     id: int  #: the unique identifier of the task
     parent_id: Optional[int] = attr.ib(repr=False)  #: the identifier of the parent task, if any
     name: Optional[str]  #: the description of the task (if any)
-    coro: Coroutine = attr.ib(repr=False)  #: the coroutine object of the task
+    _coro_or_gen: Union[CoroutineType, GeneratorType] = attr.ib(repr=False)
+
+    @property
+    def frame(self) -> Optional[FrameType]:
+        """Return the current frame of the task, or ``None`` if the task is not running."""
+        if isinstance(self._coro_or_gen, CoroutineType):
+            return self._coro_or_gen.cr_frame
+        else:
+            return self._coro_or_gen.gi_frame
+
+    @property
+    def waiting_on(self):
+        """
+        Return the object the task is currently awaiting on, or ``None`` if it's not awaiting on
+        anything).
+
+        """
+        if isinstance(self._coro_or_gen, CoroutineType):
+            return self._coro_or_gen.cr_await
+        else:
+            return self._coro_or_gen.gi_yieldfrom
+
+    @property
+    def running(self) -> bool:
+        """``True`` if the task is currently running, ``False`` if not."""
+        if isinstance(self._coro_or_gen, CoroutineType):
+            return self._coro_or_gen.cr_running
+        else:
+            return self._coro_or_gen.gi_running
 
     def __eq__(self, other):
         if isinstance(other, TaskInfo):
@@ -722,9 +751,9 @@ async def get_current_task() -> TaskInfo:
     return await _get_asynclib().get_current_task()
 
 
-async def get_running_tasks() -> typing.List[TaskInfo]:
+async def get_running_tasks() -> List[TaskInfo]:
     """
-    Return a list of running tasks in the current event loop.
+    Return a list of unfinished tasks in the current event loop.
 
     :return: a list of task info objects
 

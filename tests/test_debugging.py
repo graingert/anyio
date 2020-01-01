@@ -1,3 +1,5 @@
+from inspect import isframe
+
 import pytest
 
 from anyio import (
@@ -10,6 +12,21 @@ async def test_get_running_tasks():
         await wait_all_tasks_blocked()
         new_tasks = set(await get_running_tasks()) - existing_tasks
         task_infos[:] = sorted(new_tasks, key=lambda info: info.name or '')
+
+        assert len(task_infos) == 3
+        for task, expected_name in zip(task_infos, ['inspector', 'task1', 'task2']):
+            if task.name == 'inspector':
+                assert task.running
+                assert task.waiting_on is None
+            else:
+                assert not task.running
+                assert task.waiting_on
+
+            assert isframe(task.frame)
+            assert task.parent_id == host_task.id
+            assert task.name == expected_name
+            assert repr(task) == "TaskInfo(id={}, name={!r})".format(task.id, expected_name)
+
         await event.set()
 
     event = create_event()
@@ -21,8 +38,10 @@ async def test_get_running_tasks():
         await tg.spawn(event.wait, name='task2')
         await tg.spawn(inspect, name='inspector')
 
-    assert len(task_infos) == 3
     for task, expected_name in zip(task_infos, ['inspector', 'task1', 'task2']):
+        assert not task.running
+        assert task.frame is None
+        assert task.waiting_on is None
         assert task.parent_id == host_task.id
         assert task.name == expected_name
         assert repr(task) == "TaskInfo(id={}, name={!r})".format(task.id, expected_name)
