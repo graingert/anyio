@@ -1,11 +1,11 @@
 import math
 import socket
+import sys
 from typing import Callable, Optional, List, Union, ClassVar, Generic, TypeVar, Type
 
 import attr
 import trio.from_thread
 import trio.hazmat
-from async_generator import async_generator, yield_, asynccontextmanager, aclosing
 from trio.to_thread import run_sync
 
 from .. import claim_worker_thread, TaskInfo, MessageStream
@@ -23,6 +23,11 @@ from ..abc.tasks import CancelScope as AbstractCancelScope, TaskGroup as Abstrac
 from ..exceptions import (
     ExceptionGroup as BaseExceptionGroup, WouldBlock, ClosedResourceError, BusyResourceError)
 
+if sys.version_info < (3, 7):
+    from async_generator import asynccontextmanager
+else:
+    from contextlib import asynccontextmanager
+
 T_Retval = TypeVar('T_Retval')
 T_Item = TypeVar('T_Item')
 
@@ -37,7 +42,17 @@ run = trio.run
 # Miscellaneous
 #
 
-finalize = aclosing
+class finalize:
+    def __init__(self, aiter):
+        self._aiter = aiter
+
+    async def __aenter__(self):
+        return self._aiter
+
+    async def __aexit__(self, *args):
+        await self._aiter.aclose()
+
+
 sleep = trio.sleep
 
 
@@ -86,20 +101,18 @@ AbstractCancelScope.register(CancelScope)
 
 
 @asynccontextmanager
-@async_generator
 async def move_on_after(seconds, shield):
     with trio.move_on_after(seconds) as scope:
         scope.shield = shield
-        await yield_(CancelScope(scope))
+        yield CancelScope(scope)
 
 
 @asynccontextmanager
-@async_generator
 async def fail_after(seconds, shield):
     try:
         with trio.fail_after(seconds) as cancel_scope:
             cancel_scope.shield = shield
-            await yield_(CancelScope(cancel_scope))
+            yield CancelScope(cancel_scope)
     except trio.TooSlowError as exc:
         raise TimeoutError().with_traceback(exc.__traceback__) from None
 
@@ -598,10 +611,9 @@ AbstractCapacityLimiter.register(CapacityLimiter)
 #
 
 @asynccontextmanager
-@async_generator
 async def receive_signals(*signals: int):
     with trio.open_signal_receiver(*signals) as cm:
-        await yield_(cm)
+        yield cm
 
 
 #

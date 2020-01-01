@@ -13,7 +13,6 @@ from typing import (
 from weakref import WeakKeyDictionary
 
 import attr
-from async_generator import async_generator, yield_, asynccontextmanager, aclosing
 
 from .. import claim_worker_thread, _local, T_Retval, TaskInfo, T_Item
 from ..abc.networking import (
@@ -29,6 +28,11 @@ from ..abc.synchronization import (
 from ..abc.tasks import CancelScope as AbstractCancelScope, TaskGroup as AbstractTaskGroup
 from ..exceptions import (
     ExceptionGroup as BaseExceptionGroup, WouldBlock, ClosedResourceError, BusyResourceError)
+
+if sys.version_info < (3, 7):
+    from async_generator import asynccontextmanager
+else:
+    from contextlib import asynccontextmanager
 
 try:
     from asyncio import create_task, get_running_loop, current_task, all_tasks
@@ -108,7 +112,15 @@ def run(func: Callable[..., T_Retval], *args, debug: bool = False, use_uvloop: b
 # Miscellaneous
 #
 
-finalize = aclosing
+class finalize:
+    def __init__(self, aiter):
+        self._aiter = aiter
+
+    async def __aenter__(self):
+        return self._aiter
+
+    async def __aexit__(self, *args):
+        await self._aiter.aclose()
 
 
 async def sleep(delay: float) -> None:
@@ -261,22 +273,20 @@ def check_cancelled():
 
 
 @asynccontextmanager
-@async_generator
 async def fail_after(delay: float, shield: bool):
     deadline = get_running_loop().time() + delay
     async with CancelScope(deadline, shield) as scope:
-        await yield_(scope)
+        yield scope
 
     if scope._timeout_expired:
         raise TimeoutError
 
 
 @asynccontextmanager
-@async_generator
 async def move_on_after(delay: float, shield: bool):
     deadline = get_running_loop().time() + delay
     async with CancelScope(deadline=deadline, shield=shield) as scope:
-        await yield_(scope)
+        yield scope
 
 
 async def current_effective_deadline():
@@ -564,12 +574,11 @@ class AsyncFile:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
 
-    @async_generator
     async def __aiter__(self):
         while True:
             line = await self.readline()
             if line:
-                await yield_(line)
+                yield line
             else:
                 break
 
@@ -1089,13 +1098,11 @@ AbstractCapacityLimiter.register(CapacityLimiter)
 #
 
 @asynccontextmanager
-@async_generator
 async def receive_signals(*signals: int):
-    @async_generator
     async def process_signal_queue():
         while True:
             signum = await queue.get()
-            await yield_(signum)
+            yield signum
 
     loop = get_running_loop()
     queue = asyncio.Queue()  # type: asyncio.Queue[int]
@@ -1106,7 +1113,7 @@ async def receive_signals(*signals: int):
             loop.add_signal_handler(sig, queue.put_nowait, sig)
             handled_signals.add(sig)
 
-        await yield_(agen)
+        yield agen
     finally:
         await agen.aclose()
         for sig in handled_signals:

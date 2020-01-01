@@ -1,5 +1,6 @@
 import math
 import socket
+import sys
 from collections import OrderedDict
 from concurrent.futures import Future
 from functools import partial
@@ -16,7 +17,6 @@ import curio.socket
 import curio.ssl
 import curio.subprocess
 import curio.traps
-from async_generator import async_generator, asynccontextmanager, yield_
 
 from .. import T_Retval, claim_worker_thread, TaskInfo, _local, T_Item
 from ..abc.networking import (
@@ -32,6 +32,11 @@ from ..abc.synchronization import (
 from ..abc.tasks import CancelScope as AbstractCancelScope, TaskGroup as AbstractTaskGroup
 from ..exceptions import (
     ExceptionGroup as BaseExceptionGroup, ClosedResourceError, BusyResourceError, WouldBlock)
+
+if sys.version_info < (3, 7):
+    from async_generator import asynccontextmanager
+else:
+    from contextlib import asynccontextmanager
 
 
 #
@@ -210,22 +215,22 @@ async def check_cancelled():
 
 
 @asynccontextmanager
-@async_generator
+@curio.meta.safe_generator
 async def fail_after(delay: float, shield: bool):
     deadline = await curio.clock() + delay
     async with CancelScope(deadline, shield) as scope:
-        await yield_(scope)
+        yield scope
 
     if scope._timeout_expired:
         raise TimeoutError
 
 
 @asynccontextmanager
-@async_generator
+@curio.meta.safe_generator
 async def move_on_after(delay: float, shield: bool):
     deadline = await curio.clock() + delay
     async with CancelScope(deadline=deadline, shield=shield) as scope:
-        await yield_(scope)
+        yield scope
 
 
 async def current_effective_deadline():
@@ -902,10 +907,9 @@ AbstractCapacityLimiter.register(CapacityLimiter)
 #
 
 @asynccontextmanager
-@async_generator
 async def receive_signals(*signals: int):
-    async with curio.SignalQueue(*signals) as queue:
-        await yield_(queue)
+    with curio.SignalQueue(*signals) as queue:
+        yield queue
 
 
 #
