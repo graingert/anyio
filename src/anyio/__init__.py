@@ -410,7 +410,10 @@ async def connect_tcp(
             if interface is not None and bind_port is not None:
                 raw_socket.bind((interface, bind_port))
 
-            stream = await asynclib.connect_tcp(raw_socket, sa)
+            result = await asynclib.connect_tcp(raw_socket, sa)
+            if stream is None:
+                stream = result
+                await tg.cancel_scope.cancel()
         except OSError as exc:
             oserrors.append(exc)
             raw_socket.close()
@@ -435,10 +438,6 @@ async def connect_tcp(
             await tg.spawn(try_connect, af, sa, event)
             async with move_on_after(happy_eyeballs_delay):
                 await event.wait()
-
-            if stream is not None:
-                await tg.cancel_scope.cancel()
-                break
 
     if stream is None:
         cause = oserrors[0] if len(oserrors) == 1 else asynclib.ExceptionGroup(oserrors)
