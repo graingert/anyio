@@ -5,7 +5,6 @@ import threading
 import typing
 from contextlib import contextmanager
 from importlib import import_module
-from pprint import pprint
 from subprocess import CompletedProcess, PIPE, DEVNULL, CalledProcessError
 from typing import (
     overload, TypeVar, Callable, Union, Optional, Awaitable, Coroutine, Any, Dict, List, Type,
@@ -429,8 +428,6 @@ async def connect_tcp(
 
     target_addrs = await run_in_thread(socket.getaddrinfo, address, port, family,
                                        socket.SOCK_STREAM, cancellable=True)
-    print(f'getaddrinfo() results for {address}:{port}:')
-    pprint(target_addrs)
     oserrors: List[OSError] = []
     async with create_task_group() as tg:
         for i, (af, *rest, sa) in enumerate(target_addrs):
