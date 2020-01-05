@@ -1,7 +1,9 @@
 import socket
+from abc import abstractmethod
 from ipaddress import IPv4Address, IPv6Address
 from typing import Tuple, Union, NamedTuple, Generic, TypeVar, overload
 
+from . import AsyncResource
 from .streams import ByteStream, UnreliableMessageStream, Listener
 
 T_Address = TypeVar('T_Address')
@@ -87,3 +89,19 @@ class TCPListener(Listener[TCPSocketStream], _SocketWrapper[RawIPPort]):
 
 class UNIXListener(Listener[UNIXSocketStream], _SocketWrapper[str]):
     """A UNIX server socket."""
+
+
+class Connector(Generic[T_SocketStream, T_Address], AsyncResource):
+    """Connects to a remote socket on an arbitrary address."""
+
+    @abstractmethod
+    async def connect(self, address: T_Address) -> T_SocketStream:
+        """Connect to the given address."""
+
+
+class TCPConnector(Connector[TCPSocketStream, RawIPPort]):
+    """A TCP connector."""
+
+
+class UNIXConnector(Connector[UNIXSocketStream, str]):
+    """A UNIX socket connector."""

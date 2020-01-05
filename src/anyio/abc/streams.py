@@ -259,3 +259,17 @@ class Listener(Generic[T_Stream], AsyncResource):
     @abstractmethod
     async def accept(self) -> T_Stream:
         """Accept an incoming connection."""
+
+
+class Endpoint(Generic[T_Stream], AsyncResource):
+    @property
+    @abstractmethod
+    def connected(self) -> bool:
+        """Return ``True`` if this connector is currently connected."""
+
+    async def ensure_connected(self) -> T_Stream:
+        """
+        Ensure that a connection to the designated endpoint is available.
+
+        :return: a connected stream
+        """
