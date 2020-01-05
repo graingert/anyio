@@ -16,6 +16,7 @@ It bridges the following functionality:
 * Threads
 * Signal handling
 * Asynchronous file I/O
+* Subprocesses
 * Synchronization primitives (locks, conditions, events, semaphores, queues)
 * High level networking (TCP, UDP and UNIX sockets)
 
