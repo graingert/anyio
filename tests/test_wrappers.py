@@ -10,21 +10,6 @@ from anyio import connect_tcp
 from anyio.wrappers import TLSWrapperStream
 
 
-class TestBufferedStream:
-    async def test_read_exactly(self):
-        pass
-
-    async def test_read_until(self):
-        pass
-
-    async def test_read_chunks(self):
-        pass
-
-
-class TestTextWrapper:
-    pass
-
-
 class TestTLSWrapper:
     @pytest.fixture
     def server_context(self):
