@@ -45,7 +45,7 @@ Async file I/O
 
 .. autofunction:: anyio.open_file
 
-.. autoclass:: anyio.abc.AsyncFile
+.. autoclass:: anyio.fileio.AsyncFile
 
 Sockets and networking
 ----------------------

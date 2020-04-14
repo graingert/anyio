@@ -261,13 +261,6 @@ async def open_process(command, *, shell: bool, stdin: int, stdout: int, stderr:
 
 
 #
-# Async file I/O
-#
-
-open_file = trio.open_file
-
-
-#
 # Sockets and networking
 #
 

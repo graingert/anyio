@@ -16,6 +16,8 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
   - ``anyio.receive_signals()`` -> ``anyio.open_signal_receiver()``
   - ``anyio.run_in_thread()`` -> ``anyio.run_sync_in_worker_thread()``
   - ``anyio.current_default_thread_limiter()`` -> ``anyio.current_default_worker_thread_limiter()``
+- **BACKWARDS INCOMPATIBLE** Asynchronous file I/O functionality now uses a common code base
+  (``anyio.fileio.AsyncFile``) instead of backend-native classes
 
 **1.3.0**
 

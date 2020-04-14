@@ -21,7 +21,7 @@ from .abc.synchronization import Lock, Condition, Event, Semaphore, CapacityLimi
 from .abc.tasks import CancelScope, TaskGroup
 from .abc.networking import (
     TCPSocketStream, UNIXSocketStream, UDPSocket, IPAddressType, TCPListener, UNIXListener)
-from .abc.files import AsyncFile
+from .fileio import AsyncFile
 
 BACKENDS = 'asyncio', 'curio', 'trio'
 IPPROTO_IPV6 = getattr(socket, 'IPPROTO_IPV6', 41)  # https://bugs.python.org/issue29515
@@ -335,24 +335,22 @@ def open_process(command: Union[str, Sequence[str]], *, stdin: int = PIPE,
 # Async file I/O
 #
 
-def open_file(file: Union[str, 'os.PathLike', int], mode: str = 'r', buffering: int = -1,
-              encoding: Optional[str] = None, errors: Optional[str] = None,
-              newline: Optional[str] = None, closefd: bool = True,
-              opener: Optional[Callable] = None) -> Coroutine[Any, Any, AsyncFile]:
+
+async def open_file(file: Union[str, 'os.PathLike', int], mode: str = 'r', buffering: int = -1,
+                    encoding: Optional[str] = None, errors: Optional[str] = None,
+                    newline: Optional[str] = None, closefd: bool = True,
+                    opener: Optional[Callable] = None) -> AsyncFile:
     """
     Open a file asynchronously.
 
     The arguments are exactly the same as for the builtin :func:`open`.
 
     :return: an asynchronous file object
-    :rtype: AsyncFile
 
     """
-    if sys.version_info < (3, 6) and hasattr(file, '__fspath__'):
-        file = str(file)
-
-    return _get_asynclib().open_file(file, mode, buffering, encoding, errors, newline, closefd,
-                                     opener)
+    fp = await run_sync_in_worker_thread(open, file, mode, buffering, encoding, errors, newline,
+                                         closefd, opener)
+    return AsyncFile(fp)
 
 
 #
