@@ -209,8 +209,8 @@ def create_task_group() -> TaskGroup:
 # Threads
 #
 
-def run_in_thread(func: Callable[..., T_Retval], *args, cancellable: bool = False,
-                  limiter: Optional[CapacityLimiter] = None) -> Awaitable[T_Retval]:
+def run_sync_in_worker_thread(func: Callable[..., T_Retval], *args, cancellable: bool = False,
+                              limiter: Optional[CapacityLimiter] = None) -> Awaitable[T_Retval]:
     """
     Start a thread that calls the given function with the given arguments.
 
@@ -246,7 +246,7 @@ def run_async_from_thread(func: Callable[..., Coroutine[Any, Any, T_Retval]], *a
     return asynclib.run_async_from_thread(func, *args)
 
 
-def current_default_thread_limiter() -> CapacityLimiter:
+def current_default_worker_thread_limiter() -> CapacityLimiter:
     """
     Return the capacity limiter that is used by default to limit the number of concurrent threads.
 
@@ -335,10 +335,10 @@ def open_process(command: Union[str, Sequence[str]], *, stdin: int = PIPE,
 # Async file I/O
 #
 
-def aopen(file: Union[str, 'os.PathLike', int], mode: str = 'r', buffering: int = -1,
-          encoding: Optional[str] = None, errors: Optional[str] = None,
-          newline: Optional[str] = None, closefd: bool = True,
-          opener: Optional[Callable] = None) -> Coroutine[Any, Any, AsyncFile]:
+def open_file(file: Union[str, 'os.PathLike', int], mode: str = 'r', buffering: int = -1,
+              encoding: Optional[str] = None, errors: Optional[str] = None,
+              newline: Optional[str] = None, closefd: bool = True,
+              opener: Optional[Callable] = None) -> Coroutine[Any, Any, AsyncFile]:
     """
     Open a file asynchronously.
 
@@ -351,7 +351,8 @@ def aopen(file: Union[str, 'os.PathLike', int], mode: str = 'r', buffering: int 
     if sys.version_info < (3, 6) and hasattr(file, '__fspath__'):
         file = str(file)
 
-    return _get_asynclib().aopen(file, mode, buffering, encoding, errors, newline, closefd, opener)
+    return _get_asynclib().open_file(file, mode, buffering, encoding, errors, newline, closefd,
+                                     opener)
 
 
 #
@@ -417,8 +418,8 @@ async def connect_tcp(
     if bind_host:
         interface, family, _v6only = await get_bind_address(bind_host)
 
-    target_addrs = await run_in_thread(socket.getaddrinfo, address, port, family,
-                                       socket.SOCK_STREAM, cancellable=True)
+    target_addrs = await run_sync_in_worker_thread(socket.getaddrinfo, address, port, family,
+                                                   socket.SOCK_STREAM, cancellable=True)
     oserrors: List[OSError] = []
     async with create_task_group() as tg:
         for i, (af, *rest, sa) in enumerate(target_addrs):
@@ -546,7 +547,7 @@ async def create_udp_socket(
         interface, family = None, 0
 
     if target_host:
-        res = await run_in_thread(socket.getaddrinfo, target_host, target_port, family)
+        res = await run_sync_in_worker_thread(socket.getaddrinfo, target_host, target_port, family)
         if res:
             family, type_, proto, _cn, sa = res[0]
             target_host, target_port = sa[:2]
@@ -663,7 +664,7 @@ def create_memory_stream(cls=None):
 # Operating system signals
 #
 
-def receive_signals(*signals: int) -> UnreliableReceiveMessageStream[int]:
+def open_signal_receiver(*signals: int) -> UnreliableReceiveMessageStream[int]:
     """
     Start receiving operating system signals.
 

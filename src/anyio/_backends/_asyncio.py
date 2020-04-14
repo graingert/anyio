@@ -15,6 +15,7 @@ from weakref import WeakKeyDictionary
 import attr
 
 from .. import claim_worker_thread, _local, T_Retval, TaskInfo, T_Item
+from ..abc.files import AsyncFile as AbstractAsyncFile
 from ..abc.networking import (
     TCPSocketStream as AbstractTCPSocketStream, UNIXSocketStream as AbstractUNIXSocketStream,
     UDPPacket, UDPSocket as AbstractUDPSocket, ConnectedUDPSocket as AbstractConnectedUDPSocket,
@@ -561,18 +562,16 @@ async def open_process(command, *, shell: bool, stdin: int, stdout: int, stderr:
 # Async file I/O
 #
 
-class AsyncFile:
+class AsyncFile(AbstractAsyncFile):
     def __init__(self, fp) -> None:
         self._fp = fp
 
     def __getattr__(self, name):
         return getattr(self._fp, name)
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.close()
+    @property
+    def wrapped(self):
+        return self._fp
 
     async def __aiter__(self):
         while True:
@@ -618,11 +617,11 @@ class AsyncFile:
     async def flush(self) -> None:
         return await run_in_thread(self._fp.flush)
 
-    async def close(self) -> None:
+    async def aclose(self) -> None:
         return await run_in_thread(self._fp.close)
 
 
-async def aopen(*args, **kwargs):
+async def open_file(*args, **kwargs):
     fp = await run_in_thread(partial(open, *args, **kwargs))
     return AsyncFile(fp)
 

@@ -33,18 +33,15 @@ class AsyncFile(AsyncResource):
 
     This class also supports asynchronous iteration::
 
-        async with await aopen(...) as f:
+        async with await anyio.open_file(...) as f:
             async for line in f:
                 print(line)
     """
 
+    @property
     @abstractmethod
-    async def __aenter__(self):
-        pass
-
-    @abstractmethod
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        pass
+    def wrapped(self):
+        """The wrapped synchronous file object."""
 
     @abstractmethod
     def __aiter__(self):
@@ -96,8 +93,4 @@ class AsyncFile(AsyncResource):
 
     @abstractmethod
     async def flush(self) -> None:
-        pass
-
-    @abstractmethod
-    async def close(self) -> None:
         pass

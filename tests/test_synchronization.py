@@ -3,7 +3,7 @@ import pytest
 from anyio import (
     create_lock, create_task_group, create_event, create_semaphore, create_condition,
     open_cancel_scope, wait_all_tasks_blocked, create_capacity_limiter,
-    current_default_thread_limiter, CapacityLimiter, create_memory_stream)
+    current_default_worker_thread_limiter, CapacityLimiter, create_memory_stream)
 from anyio.exceptions import ClosedResourceError
 
 
@@ -234,7 +234,7 @@ class TestCapacityLimiter:
 
     @pytest.mark.anyio
     async def test_current_default_thread_limiter(self):
-        limiter = current_default_thread_limiter()
+        limiter = current_default_worker_thread_limiter()
         assert isinstance(limiter, CapacityLimiter)
         assert limiter.total_tokens == 40
 

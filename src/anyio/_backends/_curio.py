@@ -1,4 +1,5 @@
 import math
+import os
 import socket
 import sys
 from collections import OrderedDict, defaultdict
@@ -8,7 +9,7 @@ from signal import signal
 from threading import Thread
 from typing import (
     Callable, Set, Optional, Coroutine, Any, cast, Dict, List, Sequence, ClassVar,
-    Generic, Type, DefaultDict)
+    Generic, Type, DefaultDict, Union)
 from weakref import WeakKeyDictionary
 
 import attr
@@ -20,6 +21,7 @@ import curio.subprocess
 import curio.traps
 
 from .. import T_Retval, claim_worker_thread, TaskInfo, _local, T_Item
+from ..abc.files import AsyncFile as AbstractAsyncFile
 from ..abc.networking import (
     TCPSocketStream as AbstractTCPSocketStream, UNIXSocketStream as AbstractUNIXSocketStream,
     UDPPacket, UDPSocket as AbstractUDPSocket, ConnectedUDPSocket as AbstractConnectedUDPSocket,
@@ -495,9 +497,68 @@ async def open_process(command, *, shell: bool, stdin: int, stdout: int, stderr:
 # Async file I/O
 #
 
-async def aopen(*args, **kwargs):
+class AsyncFile(AbstractAsyncFile):
+    def __init__(self, fp) -> None:
+        self._fp = fp
+
+    def __getattr__(self, name):
+        return getattr(self._fp, name)
+
+    @property
+    def wrapped(self):
+        return self._fp
+
+    async def __aiter__(self):
+        while True:
+            line = await self.readline()
+            if line:
+                yield line
+            else:
+                break
+
+    async def read(self, size: int = -1) -> Union[bytes, str]:
+        return await run_in_thread(self._fp.read, size)
+
+    async def read1(self, size: int = -1) -> Union[bytes, str]:
+        return await run_in_thread(self._fp.read1, size)
+
+    async def readline(self) -> bytes:
+        return await run_in_thread(self._fp.readline)
+
+    async def readlines(self) -> bytes:
+        return await run_in_thread(self._fp.readlines)
+
+    async def readinto(self, b: Union[bytes, memoryview]) -> bytes:
+        return await run_in_thread(self._fp.readinto, b)
+
+    async def readinto1(self, b: Union[bytes, memoryview]) -> bytes:
+        return await run_in_thread(self._fp.readinto1, b)
+
+    async def write(self, b: bytes) -> None:
+        return await run_in_thread(self._fp.write, b)
+
+    async def writelines(self, lines: bytes) -> None:
+        return await run_in_thread(self._fp.writelines, lines)
+
+    async def truncate(self, size: Optional[int] = None) -> int:
+        return await run_in_thread(self._fp.truncate, size)
+
+    async def seek(self, offset: int, whence: Optional[int] = os.SEEK_SET) -> int:
+        return await run_in_thread(self._fp.seek, offset, whence)
+
+    async def tell(self) -> int:
+        return await run_in_thread(self._fp.tell)
+
+    async def flush(self) -> None:
+        return await run_in_thread(self._fp.flush)
+
+    async def aclose(self) -> None:
+        return await run_in_thread(self._fp.close)
+
+
+async def open_file(*args, **kwargs):
     fp = await run_in_thread(partial(open, *args, **kwargs))
-    return curio.file.AsyncFile(fp)
+    return AsyncFile(fp)
 
 
 #

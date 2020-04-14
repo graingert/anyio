@@ -7,6 +7,15 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 - **BACKWARDS INCOMPATIBLE** Removed the ``anyio.finalize()`` context manager since as of curio
   1.0, it is no longer necessary. Use ``async_generator.aclosing()`` instead.
+- **BACKWARDS INCOMPATIBLE** Renamed some functions and methods to match their corresponding names
+  in Trio:
+
+  - ``Stream.close()`` -> ``Stream.aclose()``
+  - ``AsyncFile.close()`` -> ``AsyncFile.aclose()``
+  - ``anyio.aopen()`` -> ``anyio.open_file()``
+  - ``anyio.receive_signals()`` -> ``anyio.open_signal_receiver()``
+  - ``anyio.run_in_thread()`` -> ``anyio.run_sync_in_worker_thread()``
+  - ``anyio.current_default_thread_limiter()`` -> ``anyio.current_default_worker_thread_limiter()``
 
 **1.3.0**
 

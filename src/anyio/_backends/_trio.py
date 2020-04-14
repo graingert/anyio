@@ -264,10 +264,7 @@ async def open_process(command, *, shell: bool, stdin: int, stdout: int, stderr:
 # Async file I/O
 #
 
-async def aopen(*args, **kwargs):
-    f = await trio.open_file(*args, **kwargs)
-    f.close = f.aclose
-    return f
+open_file = trio.open_file
 
 
 #

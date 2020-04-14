@@ -36,14 +36,14 @@ Task groups
 Threads
 -------
 
-.. autofunction:: anyio.run_in_thread
+.. autofunction:: anyio.run_sync_in_worker_thread
 .. autofunction:: anyio.run_async_from_thread
-.. autofunction:: anyio.current_default_thread_limiter
+.. autofunction:: anyio.current_default_worker_thread_limiter
 
 Async file I/O
 --------------
 
-.. autofunction:: anyio.aopen
+.. autofunction:: anyio.open_file
 
 .. autoclass:: anyio.abc.AsyncFile
 
@@ -103,7 +103,7 @@ Synchronization
 Operating system signals
 ------------------------
 
-.. autofunction:: anyio.receive_signals
+.. autofunction:: anyio.open_signal_receiver
 
 Testing and debugging
 ---------------------
