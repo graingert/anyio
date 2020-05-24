@@ -5,7 +5,7 @@ from typing import Callable, Optional, List, Union, ClassVar, Generic, TypeVar, 
 
 import attr
 import trio.from_thread
-import trio.hazmat
+import trio.lowlevel
 from trio.to_thread import run_sync
 
 from .. import claim_worker_thread, TaskInfo, MessageStream
@@ -469,12 +469,27 @@ class Event:
         await self._event.wait()
 
 
-class Condition(trio.Condition):
+class Condition:
+    def __init__(self, lock: Optional[trio.Lock] = None):
+        self._cond = trio.Condition(lock=lock)
+
+    async def __aenter__(self):
+        await self._cond.__aenter__()
+
+    async def __aexit__(self, *exc_info):
+        return await self._cond.__aexit__(*exc_info)
+
     async def notify(self, n: int = 1) -> None:
-        super().notify(n)
+        self._cond.notify(n)
 
     async def notify_all(self) -> None:
-        super().notify_all()
+        self._cond.notify_all()
+
+    def locked(self):
+        return self._cond.locked()
+
+    async def wait(self):
+        return await self._cond.wait()
 
 
 Semaphore = trio.Semaphore
@@ -611,7 +626,7 @@ async def receive_signals(*signals: int):
 #
 
 async def get_current_task() -> TaskInfo:
-    task = trio.hazmat.current_task()
+    task = trio.lowlevel.current_task()
 
     parent_id = None
     if task.parent_nursery and task.parent_nursery.parent_task:
@@ -621,7 +636,7 @@ async def get_current_task() -> TaskInfo:
 
 
 async def get_running_tasks() -> List[TaskInfo]:
-    root_task = trio.hazmat.current_root_task()
+    root_task = trio.lowlevel.current_root_task()
     task_infos = [TaskInfo(id(root_task), None, root_task.name, root_task.coro)]
     nurseries = root_task.child_nurseries
     while nurseries:
