@@ -18,7 +18,7 @@ from ._utils import get_bind_address
 from .abc.streams import UnreliableReceiveMessageStream, MessageStream
 from .abc.subprocesses import AsyncProcess
 from .abc.synchronization import Lock, Condition, Event, Semaphore, CapacityLimiter
-from .abc.tasks import CancelScope, TaskGroup
+from .abc.tasks import CancelScope, TaskGroup, BlockingPortal
 from .abc.networking import (
     TCPSocketStream, UNIXSocketStream, UDPSocket, IPAddressType, TCPListener, UNIXListener)
 from .fileio import AsyncFile
@@ -254,6 +254,37 @@ def current_default_worker_thread_limiter() -> CapacityLimiter:
 
     """
     return _get_asynclib().current_default_thread_limiter()
+
+
+def create_blocking_portal() -> BlockingPortal:
+    """Create a portal for running functions in the event loop thread."""
+    return _get_asynclib().BlockingPortal()
+
+
+def start_blocking_portal(
+        backend: str = BACKENDS[0],
+        backend_options: Optional[Dict[str, Any]] = None) -> BlockingPortal:
+    """
+    Start a new event loop in a new thread and run a blocking portal in its main task.
+
+    :param backend:
+    :param backend_options:
+    :return: a blocking portal object
+
+    """
+    async def run_portal():
+        nonlocal portal
+        async with create_blocking_portal() as portal:
+            event.set()
+            await portal.sleep_until_stopped()
+
+    portal: Optional[BlockingPortal]
+    event = threading.Event()
+    kwargs = {'func': run_portal, 'backend': backend, 'backend_options': backend_options}
+    thread = threading.Thread(target=run, kwargs=kwargs)
+    thread.start()
+    event.wait()
+    return typing.cast(BlockingPortal, portal)
 
 
 #

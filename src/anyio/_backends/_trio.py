@@ -1,6 +1,7 @@
 import math
 import socket
 import sys
+from concurrent.futures._base import Future
 from typing import Callable, Optional, List, Union, ClassVar, Generic, TypeVar, Type
 
 import attr
@@ -19,7 +20,9 @@ from ..abc.subprocesses import AsyncProcess as AbstractAsyncProcess
 from ..abc.synchronization import (
     Lock as AbstractLock, Condition as AbstractCondition, Event as AbstractEvent,
     Semaphore as AbstractSemaphore, CapacityLimiter as AbstractCapacityLimiter)
-from ..abc.tasks import CancelScope as AbstractCancelScope, TaskGroup as AbstractTaskGroup
+from ..abc.tasks import (
+    CancelScope as AbstractCancelScope, TaskGroup as AbstractTaskGroup,
+    BlockingPortal as AbstractBlockingPortal)
 from ..exceptions import (
     ExceptionGroup as BaseExceptionGroup, WouldBlock, ClosedResourceError, BusyResourceError)
 
@@ -179,6 +182,18 @@ async def run_in_thread(func: Callable[..., T_Retval], *args, cancellable: bool 
     return await run_sync(wrapper, cancellable=cancellable, limiter=trio_limiter)
 
 run_async_from_thread = trio.from_thread.run
+
+
+class BlockingPortal(AbstractBlockingPortal):
+    __slots__ = '_token'
+
+    def __init__(self):
+        super().__init__()
+        self._token = trio.lowlevel.current_trio_token()
+
+    def _spawn_task_from_thread(self, func: Callable, args: tuple, future: Future) -> None:
+        return trio.from_thread.run(self._task_group.spawn, self._call_func, func, args, future,
+                                    trio_token=self._token)
 
 
 #

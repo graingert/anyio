@@ -4,6 +4,7 @@ import math
 import socket
 import sys
 from collections import OrderedDict
+from concurrent.futures._base import Future
 from threading import Thread
 from typing import (
     Callable, Set, Optional, Union, Tuple, cast, Coroutine, Any, Awaitable, TypeVar, Generator,
@@ -23,7 +24,9 @@ from ..abc.subprocesses import AsyncProcess as AbstractAsyncProcess
 from ..abc.synchronization import (
     Lock as AbstractLock, Condition as AbstractCondition, Event as AbstractEvent,
     Semaphore as AbstractSemaphore, CapacityLimiter as AbstractCapacityLimiter)
-from ..abc.tasks import CancelScope as AbstractCancelScope, TaskGroup as AbstractTaskGroup
+from ..abc.tasks import (
+    CancelScope as AbstractCancelScope, TaskGroup as AbstractTaskGroup,
+    BlockingPortal as AbstractBlockingPortal)
 from ..exceptions import (
     ExceptionGroup as BaseExceptionGroup, WouldBlock, ClosedResourceError, BusyResourceError)
 
@@ -97,8 +100,9 @@ def run(func: Callable[..., T_Retval], *args, debug: bool = False, use_uvloop: b
     # fixtures which require one run() call for setup, one for the actual test and one for
     # teardown.
     exception = retval = None
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
     loop.set_debug(debug)
+    asyncio.set_event_loop(loop)
     loop.run_until_complete(wrapper())
     if exception is not None:
         raise exception
@@ -467,6 +471,18 @@ def run_async_from_thread(func: Callable[..., Coroutine[Any, Any, T_Retval]], *a
     f = asyncio.run_coroutine_threadsafe(
         func(*args), _local.loop)  # type: concurrent.futures.Future[T_Retval]
     return f.result()
+
+
+class BlockingPortal(AbstractBlockingPortal):
+    __slots__ = '_loop'
+
+    def __init__(self):
+        super().__init__()
+        self._loop = get_running_loop()
+
+    def _spawn_task_from_thread(self, func: Callable, args: tuple, future: Future) -> None:
+        asyncio.run_coroutine_threadsafe(
+            self._task_group.spawn(self._call_func, func, args, future), self._loop)
 
 
 #
