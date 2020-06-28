@@ -1,8 +1,8 @@
 import threading
 from abc import ABCMeta, abstractmethod
 from collections import Coroutine
-from concurrent.futures._base import Future
-from inspect import iscoroutine
+from concurrent.futures import Future
+from inspect import isawaitable
 from types import TracebackType
 from typing import Callable, Type, Optional, TypeVar
 
@@ -95,14 +95,14 @@ class BlockingPortal(metaclass=ABCMeta):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.stop()
+        await self.stop(cancel_remaining=exc_val is not None)
         return await self._task_group.__aexit__(exc_type, exc_val, exc_tb)
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.call(self.stop, exc_type is not None)
+        self.stop_from_external_thread(cancel_remaining=exc_val is not None)
 
     async def sleep_until_stopped(self) -> None:
         """Sleep until :meth:`stop` is called."""
@@ -132,7 +132,7 @@ class BlockingPortal(metaclass=ABCMeta):
     async def _call_func(self, func: Callable, args: tuple, future: Future) -> None:
         try:
             retval = func(*args)
-            if iscoroutine(retval):
+            if isawaitable(retval):
                 future.set_result(await retval)
             else:
                 future.set_result(retval)

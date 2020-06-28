@@ -1,11 +1,27 @@
-from functools import partial
+from contextlib import contextmanager
 from inspect import iscoroutinefunction
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 
 import pytest
 from async_generator import isasyncgenfunction
 
-from . import run, BACKENDS
+from . import BACKENDS, open_test_runner, TestRunner
+
+_runners: Dict[Tuple[str, str], TestRunner] = {}
+
+
+@contextmanager
+def get_runner(backend: str, options: Dict[str, Any]):
+    key = backend, str(options)
+    if key in _runners:
+        yield _runners[key]
+    else:
+        with open_test_runner(backend, **options) as runner:
+            _runners[key] = runner
+            try:
+                yield runner
+            finally:
+                del _runners[key]
 
 
 def pytest_configure(config):
@@ -23,31 +39,32 @@ def pytest_addoption(parser):
 
 def pytest_fixture_setup(fixturedef, request):
     def wrapper(*args, **kwargs):
-        run_kwargs = {'backend': kwargs['anyio_backend_name'],
-                      'backend_options': kwargs['anyio_backend_options']}
+        backend_name = kwargs['anyio_backend_name']
+        backend_options = kwargs.get('anyio_backend_options', {})
         if 'anyio_backend_name' in strip_argnames:
             del kwargs['anyio_backend_name']
         if 'anyio_backend_options' in strip_argnames:
             del kwargs['anyio_backend_options']
 
-        if isasyncgenfunction(func):
-            gen = func(*args, **kwargs)
-            try:
-                value = run(gen.__anext__, **run_kwargs)
-            except StopAsyncIteration:
-                raise RuntimeError('Async generator did not yield')
+        with get_runner(backend_name, backend_options) as runner:
+            if isasyncgenfunction(func):
+                gen = func(*args, **kwargs)
+                try:
+                    value = runner.call(gen.asend, None)
+                except StopAsyncIteration:
+                    raise RuntimeError('Async generator did not yield')
 
-            yield value
+                yield value
 
-            try:
-                run(gen.__anext__, **run_kwargs)
-            except StopAsyncIteration:
-                pass
+                try:
+                    runner.call(gen.asend, None)
+                except StopAsyncIteration:
+                    pass
+                else:
+                    runner.call(gen.aclose)
+                    raise RuntimeError('Async generator fixture did not stop')
             else:
-                run(gen.aclose, **run_kwargs)
-                raise RuntimeError('Async generator fixture did not stop')
-        else:
-            yield run(partial(func, *args, **kwargs), **run_kwargs)
+                yield runner.call(func, *args, **kwargs)
 
     func = fixturedef.func
     if (isasyncgenfunction(func) or iscoroutinefunction(func)) and 'anyio' in request.keywords:
@@ -85,7 +102,8 @@ def pytest_generate_tests(metafunc):
 @pytest.hookimpl(tryfirst=True)
 def pytest_pyfunc_call(pyfuncitem):
     def run_with_hypothesis(**kwargs):
-        run(partial(original_func, **kwargs), backend=backend)
+        with get_runner(backend_name, backend_options) as runner:
+            runner.call(original_func, **kwargs)
 
     try:
         backend = pyfuncitem.callspec.getparam('anyio_backend')
@@ -94,9 +112,9 @@ def pytest_pyfunc_call(pyfuncitem):
 
     if backend:
         if isinstance(backend, str):
-            backend, backend_options = backend, {}
+            backend_name, backend_options = backend, {}
         else:
-            backend, backend_options = backend
+            backend_name, backend_options = backend
             if not isinstance(backend, str) or not isinstance(backend_options, dict):
                 raise TypeError('anyio_backend must be either a string or tuple of (string, dict)')
 
@@ -112,8 +130,9 @@ def pytest_pyfunc_call(pyfuncitem):
         if iscoroutinefunction(pyfuncitem.obj):
             funcargs = pyfuncitem.funcargs
             testargs = {arg: funcargs[arg] for arg in pyfuncitem._fixtureinfo.argnames}
-            run(partial(pyfuncitem.obj, **testargs), backend=backend,
-                backend_options=backend_options)
+            with get_runner(backend_name, backend_options) as runner:
+                runner.call(pyfuncitem.obj, **testargs)
+
             return True
 
 

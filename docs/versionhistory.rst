@@ -18,6 +18,8 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
   - ``anyio.current_default_thread_limiter()`` -> ``anyio.current_default_worker_thread_limiter()``
 - **BACKWARDS INCOMPATIBLE** Asynchronous file I/O functionality now uses a common code base
   (``anyio.fileio.AsyncFile``) instead of backend-native classes
+- Added ``open_test_runner()`` which is used by the pytest plugin to ensure that all fixtures are
+  run inside the same event loop as the test itself
 - Added support for "blocking portals" which allow running functions in the event loop thread from
   external threads
 - Dropped support for trio < 0.16

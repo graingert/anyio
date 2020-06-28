@@ -45,10 +45,12 @@ with the same backend as the test itself. Both plain coroutine functions and asy
 functions are supported in the same manner as pytest itself does with regular functions and
 generator functions.
 
-.. note:: If you need Python 3.5 compatibility, please use the async_generator_ library to replace
-          the async generator syntax that was introduced in Python 3.6.
-
-.. _async_generator: https://github.com/python-trio/async_generator
+Fixtures can have any scope, from ``function`` to ``session``. If the scope is broader than
+``function``, the same event loop will be used until the teardown of the fixture that first
+requested the specific combination of a backend and its options. In practice this means that if you
+only have function scoped async fixtures (or no async fixtures at all), each test gets its own
+event loop. Then again, if you have a module scoped async fixture, every test and fixture in that
+module will be run with the same event loop.
 
 Specifying the backend to run on
 --------------------------------

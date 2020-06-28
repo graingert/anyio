@@ -21,6 +21,7 @@ from .abc.synchronization import Lock, Condition, Event, Semaphore, CapacityLimi
 from .abc.tasks import CancelScope, TaskGroup, BlockingPortal
 from .abc.networking import (
     TCPSocketStream, UNIXSocketStream, UDPSocket, IPAddressType, TCPListener, UNIXListener)
+from .abc.testing import TestRunner
 from .fileio import AsyncFile
 
 BACKENDS = 'asyncio', 'curio', 'trio'
@@ -90,8 +91,10 @@ def claim_worker_thread(backend) -> typing.Generator[Any, None, None]:
         del _local.current_async_module
 
 
-def _get_asynclib():
-    asynclib_name = sniffio.current_async_library()
+def _get_asynclib(asynclib_name: Optional[str] = None):
+    if asynclib_name is None:
+        asynclib_name = sniffio.current_async_library()
+
     modulename = 'anyio._backends._' + asynclib_name
     try:
         return sys.modules[modulename]
@@ -781,3 +784,21 @@ async def get_running_tasks() -> List[TaskInfo]:
 async def wait_all_tasks_blocked() -> None:
     """Wait until all other tasks are waiting for something."""
     await _get_asynclib().wait_all_tasks_blocked()
+
+
+@contextmanager
+def open_test_runner(backend: str, backend_options: Optional[Dict[str, Any]] = None) -> \
+        typing.Generator[TestRunner, None, None]:
+    asynclib = _get_asynclib(backend)
+    token = None
+    if sniffio.current_async_library_cvar.get(None) is None:
+        # Since we're in control of the event loop, we can cache the name of the async library
+        token = sniffio.current_async_library_cvar.set(backend)
+
+    try:
+        backend_options = backend_options or {}
+        with asynclib.TestRunner(**backend_options) as runner:
+            yield runner
+    finally:
+        if token:
+            sniffio.current_async_library_cvar.reset(token)

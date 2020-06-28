@@ -27,6 +27,7 @@ from ..abc.synchronization import (
 from ..abc.tasks import (
     CancelScope as AbstractCancelScope, TaskGroup as AbstractTaskGroup,
     BlockingPortal as AbstractBlockingPortal)
+from ..abc.testing import TestRunner as AbstractTestRunner
 from ..exceptions import (
     ExceptionGroup as BaseExceptionGroup, WouldBlock, ClosedResourceError, BusyResourceError)
 
@@ -40,7 +41,7 @@ try:
 except ImportError:
     _T = TypeVar('_T')
 
-    def create_task(coro: Union[Generator[Any, None, _T], Awaitable[_T]], *,
+    def create_task(coro: Union[Generator[Any, None, _T], Awaitable[_T]], *,  # type: ignore
                     name: Optional[str] = None) -> asyncio.Task:
         return get_running_loop().create_task(coro)
 
@@ -73,15 +74,9 @@ _native_task_names = sys.version_info >= (3, 8)
 # Event loop
 #
 
-def run(func: Callable[..., T_Retval], *args, debug: bool = False, use_uvloop: bool = True,
-        policy: Optional[asyncio.AbstractEventLoopPolicy] = None) -> T_Retval:
-    async def wrapper():
-        nonlocal exception, retval
-        try:
-            retval = await func(*args)
-        except BaseException as exc:
-            exception = exc
-
+def _create_event_loop(
+        debug: bool = False, use_uvloop: bool = True,
+        policy: Optional[asyncio.AbstractEventLoopPolicy] = None) -> asyncio.AbstractEventLoop:
     # On CPython, use uvloop when possible if no other policy has been given and if not explicitly
     # disabled
     if policy is None and use_uvloop and sys.implementation.name == 'cpython':
@@ -99,11 +94,25 @@ def run(func: Callable[..., T_Retval], *args, debug: bool = False, use_uvloop: b
     # tasks and shuts down all async generators, making it unsuitable for things like pytest
     # fixtures which require one run() call for setup, one for the actual test and one for
     # teardown.
-    exception = retval = None
     loop = asyncio.new_event_loop()
     loop.set_debug(debug)
     asyncio.set_event_loop(loop)
+    return loop
+
+
+def run(func: Callable[..., T_Retval], *args, debug: bool = False, use_uvloop: bool = True,
+        policy: Optional[asyncio.AbstractEventLoopPolicy] = None) -> T_Retval:
+    async def wrapper():
+        nonlocal exception, retval
+        try:
+            retval = await func(*args)
+        except BaseException as exc:
+            exception = exc
+
+    exception = retval = None
+    loop = _create_event_loop(debug, use_uvloop, policy)
     loop.run_until_complete(wrapper())
+    loop.close()
     if exception is not None:
         raise exception
     else:
@@ -1097,3 +1106,20 @@ async def wait_all_tasks_blocked() -> None:
                 break
         else:
             return
+
+
+class TestRunner(AbstractTestRunner):
+    def __init__(self, **options):
+        self._loop = _create_event_loop(**options)
+        asyncio.set_event_loop(self._loop)
+
+    def close(self) -> None:
+        try:
+            self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+        finally:
+            asyncio.set_event_loop(None)
+            self._loop.stop()
+            self._loop.close()
+
+    def call(self, func: Callable[..., Awaitable], *args, **kwargs):
+        return self._loop.run_until_complete(func(*args, **kwargs))

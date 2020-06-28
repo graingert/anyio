@@ -7,7 +7,7 @@ from signal import signal
 from threading import Thread
 from typing import (
     Callable, Set, Optional, Coroutine, Any, cast, Dict, List, Sequence, ClassVar, Generic, Type,
-    DefaultDict)
+    DefaultDict, Awaitable)
 from weakref import WeakKeyDictionary
 
 import attr
@@ -32,6 +32,7 @@ from ..abc.synchronization import (
 from ..abc.tasks import (
     CancelScope as AbstractCancelScope, TaskGroup as AbstractTaskGroup,
     BlockingPortal as AbstractBlockingPortal)
+from ..abc.testing import TestRunner as AbstractTestRunner
 from ..exceptions import (
     ExceptionGroup as BaseExceptionGroup, ClosedResourceError, BusyResourceError, WouldBlock)
 
@@ -1000,3 +1001,19 @@ async def wait_all_tasks_blocked() -> None:
                 break
         else:
             return
+
+
+class TestRunner(AbstractTestRunner):
+    def __init__(self, **options):
+        self._kernel = curio.Kernel(**options)
+
+    def close(self) -> None:
+        self._kernel.run(shutdown=True)
+
+    def call(self, func: Callable[..., Awaitable], *args, **kwargs):
+        async def call():
+            # This wrapper is needed because curio kernels cannot run() the asend() method of async
+            # generators because it's neither a coroutine object or a coroutine function
+            return await func(*args, **kwargs)
+
+        return self._kernel.run(call)
