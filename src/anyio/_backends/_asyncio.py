@@ -37,6 +37,9 @@ from .._core._tasks import CancelScope as BaseCancelScope
 from ..abc import IPSockAddrType, UDPPacketType
 from ..lowlevel import RunVar
 
+import logging
+logger = logging.getLogger(__name__)
+
 if sys.version_info >= (3, 8):
     get_coro = asyncio.Task.get_coro
 else:
@@ -1868,7 +1871,11 @@ class TestRunner(abc.TestRunner):
             exception = task.exception()
             if exception is not None:
                 exceptions.append(exception)
-                del exception
+                logger.exception(
+                    "%(task)r task failed %(exc)r",
+                    {"task": task, "exc": exception},
+                    exc_info=exception,
+                )
 
         if len(exceptions) == 1:
             raise exceptions[0]
