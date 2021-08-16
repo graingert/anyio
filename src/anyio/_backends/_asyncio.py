@@ -1861,11 +1861,19 @@ class TestRunner(abc.TestRunner):
 
         self._loop.run_until_complete(asyncio.gather(*to_cancel, return_exceptions=True))
 
+        exceptions = []
         for task in to_cancel:
             if task.cancelled():
                 continue
-            if task.exception() is not None:
-                raise cast(BaseException, task.exception())
+            exception = task.exception()
+            if exception is not None:
+                exceptions.append(exception)
+                del exception
+
+        if len(exceptions) == 1:
+            raise exceptions[0]
+        elif exceptions:
+            raise ExceptionGroup(exceptions)
 
     def close(self) -> None:
         try:
