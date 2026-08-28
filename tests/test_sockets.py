@@ -38,6 +38,7 @@ from pytest_mock.plugin import MockerFixture
 from anyio import (
     BrokenResourceError,
     BusyResourceError,
+    CancelScope,
     ClosedResourceError,
     EndOfStream,
     Event,
@@ -77,6 +78,7 @@ from anyio.abc import (
     SocketAttribute,
     SocketListener,
     SocketStream,
+    TaskStatus,
     UDPSocket,
     UNIXDatagramSocket,
     UNIXSocketStream,
@@ -93,6 +95,8 @@ if sys.version_info < (3, 11):
 if TYPE_CHECKING:
     from _typeshed import FileDescriptorLike
 
+    from anyio._backends._asyncio import ConnectedUDPSocket as AsyncIOConnectedUDPSocket
+    from anyio._backends._asyncio import DatagramProtocol
     from anyio.pytest_plugin import FreePortFactory
 
 AnyIPAddressFamily = Literal[
@@ -2548,6 +2552,95 @@ async def test_datagram_protocol_wakes_up_one_waiter() -> None:
     protocol.resume_writing()
     assert write_future.done()
     assert not protocol.write_paused
+
+
+def make_paused_udp_socket() -> tuple[AsyncIOConnectedUDPSocket, DatagramProtocol]:
+    """
+    Make a connected UDP socket whose transport has stopped accepting datagrams, so a
+    task calling ``send()`` blocks waiting for it to drain.
+    """
+    from anyio._backends._asyncio import ConnectedUDPSocket as _ConnectedUDPSocket
+    from anyio._backends._asyncio import DatagramProtocol
+
+    protocol = DatagramProtocol()
+    protocol.connection_made(MagicMock())
+    protocol.pause_writing()
+    transport = MagicMock()
+    transport.is_closing.return_value = False
+    return _ConnectedUDPSocket(transport, protocol), protocol
+
+
+@pytest.mark.parametrize("anyio_backend", asyncio_params)
+async def test_datagram_error_handed_over_by_cancelled_sender() -> None:
+    """
+    A sender that is cancelled before it can claim the error reported to it has to hand
+    that error over to the receiver instead of letting it go unreported.
+    """
+    udp, protocol = make_paused_udp_socket()
+    receiver_claimed_error = Event()
+
+    async def receiver() -> None:
+        with pytest.raises(BrokenResourceError):
+            await udp.receive()
+
+        receiver_claimed_error.set()
+
+    async def sender(*, task_status: TaskStatus[CancelScope]) -> None:
+        with CancelScope() as scope:
+            task_status.started(scope)
+            await udp.send(b"foo")
+
+    # Without the handover, the receiver is never woken up, so bound the wait
+    with fail_after(3):
+        async with create_task_group() as tg:
+            tg.start_soon(receiver)
+            send_scope = await tg.start(sender)
+            await wait_all_tasks_blocked()
+
+            # A send is in progress, so the error is meant for the sender, but it is
+            # cancelled before it can be woken up for it
+            send_scope.cancel()
+            protocol.error_received(ConnectionRefusedError())
+
+    assert receiver_claimed_error.is_set()
+    assert protocol.take_exception() is None
+
+
+@pytest.mark.parametrize("anyio_backend", asyncio_params)
+async def test_datagram_error_handed_over_by_woken_up_sender() -> None:
+    """
+    Ditto, but for a sender cancelled just *after* being woken up for the error, as
+    asyncio cancellation preempts an already delivered future result.
+
+    Cancel scopes never produce this ordering, as they skip tasks whose ``_fut_waiter``
+    has already been resolved, letting them claim the error on the next cycle. Code
+    embedding anyio in an asyncio application can, though, be it via
+    ``asyncio.timeout()``, ``asyncio.wait_for()`` or a plain ``Task.cancel()``.
+    """
+    udp, protocol = make_paused_udp_socket()
+    receiver_claimed_error = Event()
+
+    async def receiver() -> None:
+        with pytest.raises(BrokenResourceError):
+            await udp.receive()
+
+        receiver_claimed_error.set()
+
+    with fail_after(3):
+        async with create_task_group() as tg:
+            tg.start_soon(receiver)
+            send_task = asyncio.ensure_future(udp.send(b"foo"))
+            await wait_all_tasks_blocked()
+
+            # The error is meant for the sender, and it is even woken up for it, but
+            # the cancellation lands before it gets to claim it
+            protocol.error_received(ConnectionRefusedError())
+            send_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await send_task
+
+    assert receiver_claimed_error.is_set()
+    assert protocol.take_exception() is None
 
 
 @pytest.mark.skipif(

@@ -1351,6 +1351,16 @@ class DatagramProtocol(asyncio.DatagramProtocol):
         self.read_future = future = get_running_loop().create_future()
         try:
             await future
+        except BaseException:
+            # We're leaving (most likely cancelled) without having claimed any error
+            # reported in the meantime, so hand it to the sender rather than let it go
+            # unreported. A sender can't currently be waiting with an error left
+            # unclaimed, as send() drains them before it parks, but keep the handover
+            # symmetric in case that ever changes
+            if self.exceptions:
+                self._wake_sender()
+
+            raise
         finally:
             self.read_future = None
 
@@ -1359,6 +1369,12 @@ class DatagramProtocol(asyncio.DatagramProtocol):
         self.write_future = future = get_running_loop().create_future()
         try:
             await future
+        except BaseException:
+            # Ditto, but the other way around
+            if self.exceptions:
+                self._wake_receiver()
+
+            raise
         finally:
             self.write_future = None
 
