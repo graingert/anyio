@@ -27,11 +27,12 @@ from collections.abc import (
     Callable,
     Collection,
     Coroutine,
+    Generator,
     Iterable,
     Sequence,
 )
 from concurrent.futures import Future
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from contextvars import Context, copy_context
 from dataclasses import dataclass, field
 from functools import partial, wraps
@@ -1289,67 +1290,97 @@ class StreamProtocol(asyncio.Protocol):
 class DatagramProtocol(asyncio.DatagramProtocol):
     read_queue: deque[tuple[bytes, IPSockAddrType]]
     exceptions: deque[Exception]
-    read_event: asyncio.Event
-    write_event: asyncio.Event
     closed_event: asyncio.Event
+    # There can only ever be one receiver and one sender (both socket classes guard
+    # against concurrent use), so a single future each is enough to wake them up
+    read_future: asyncio.Future[None] | None = None
+    write_future: asyncio.Future[None] | None = None
     write_paused: bool = False
+    send_in_progress: bool = False
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.read_queue = deque(maxlen=100)  # arbitrary value
         # Unbounded, as every error reported by the OS must be raised exactly once
         self.exceptions = deque()
-        self.read_event = asyncio.Event()
-        self.write_event = asyncio.Event()
         self.closed_event = asyncio.Event()
-        self.write_event.set()
         cast(asyncio.WriteTransport, transport).set_write_buffer_limits(0)
 
     def connection_lost(self, exc: Exception | None) -> None:
         if exc:
             self.exceptions.append(exc)
 
-        self.read_event.set()
-        self.write_event.set()
+        # The transport is gone, so everybody waiting on it has to be woken up
+        self._wake_receiver()
+        self._wake_sender()
         self.closed_event.set()
 
     def datagram_received(self, data: bytes, addr: IPSockAddrType) -> None:
         addr = convert_ipv6_sockaddr(addr)
         self.read_queue.append((data, addr))
-        self.read_event.set()
+        self._wake_receiver()
 
     def error_received(self, exc: Exception) -> None:
         self.exceptions.append(exc)
-        self.read_event.set()
-        self.write_event.set()
+
+        # Only one task can claim the error, so only one is woken up: the sender if a
+        # send is in progress (the error was most likely caused by it), and the
+        # receiver otherwise. A sender that is not waiting for the transport to drain
+        # picks the error up from the queue as soon as sendto() returns.
+        if self.send_in_progress:
+            self._wake_sender()
+        else:
+            self._wake_receiver()
 
     def pause_writing(self) -> None:
         self.write_paused = True
-        self.write_event.clear()
 
     def resume_writing(self) -> None:
         self.write_paused = False
-        self.write_event.set()
+        self._wake_sender()
+
+    def _wake_receiver(self) -> None:
+        if (future := self.read_future) is not None and not future.done():
+            future.set_result(None)
+
+    def _wake_sender(self) -> None:
+        if (future := self.write_future) is not None and not future.done():
+            future.set_result(None)
+
+    async def wait_readable(self) -> None:
+        """Wait until a datagram arrives, or the state of the transport changes."""
+        self.read_future = future = get_running_loop().create_future()
+        try:
+            await future
+        finally:
+            self.read_future = None
+
+    async def wait_writable(self) -> None:
+        """Wait until the transport can be written to, or its state changes."""
+        self.write_future = future = get_running_loop().create_future()
+        try:
+            await future
+        finally:
+            self.write_future = None
+
+    @contextmanager
+    def sending(self) -> Generator[None]:
+        """
+        Mark a send as being in progress, so that any error reported by the transport
+        in the meantime is handed to the sender instead of a receiver waiting for a
+        datagram.
+        """
+        self.send_in_progress = True
+        try:
+            yield
+        finally:
+            self.send_in_progress = False
 
     def take_exception(self) -> Exception | None:
         """
         Return the oldest error reported by the transport, removing it from the queue so
         that it's only reported once, just like the OS does.
-
-        The read event is left alone, as ``receive()`` clears it before waiting on it
-        anyway. The write event, however, was set by :meth:`error_received` in order to
-        wake up any sender waiting on it, so it has to be cleared again if the transport
-        is still paused and no error is left to report, or the back-pressure would be
-        lost.
-
         """
-        if not self.exceptions:
-            return None
-
-        exc = self.exceptions.popleft()
-        if self.write_paused and not self.exceptions:
-            self.write_event.clear()
-
-        return exc
+        return self.exceptions.popleft() if self.exceptions else None
 
 
 class SocketStream(abc.SocketStream):
@@ -1728,8 +1759,8 @@ class UDPSocket(abc.UDPSocket):
             await AsyncIOBackend.checkpoint()
 
             # Wait until there's a packet in the buffer. An error reported by the
-            # transport also wakes us up, but it may have been claimed by a sender
-            # already, in which case there's nothing to do but wait for more data.
+            # transport also wakes us up, but a send started in the meantime may have
+            # claimed it, in which case there's nothing to do but wait for more data.
             while not self._protocol.read_queue:
                 if self._closed:
                     raise ClosedResourceError
@@ -1738,8 +1769,7 @@ class UDPSocket(abc.UDPSocket):
                 elif self._transport.is_closing():
                     raise BrokenResourceError
 
-                self._protocol.read_event.clear()
-                await self._protocol.read_event.wait()
+                await self._protocol.wait_readable()
 
             return self._protocol.read_queue.popleft()
 
@@ -1753,27 +1783,27 @@ class UDPSocket(abc.UDPSocket):
             elif self._transport.is_closing():
                 raise BrokenResourceError
 
-            self._transport.sendto(*item)
+            with self._protocol.sending():
+                self._transport.sendto(*item)
 
-            # If the OS refused the datagram, the transport has buffered it and
-            # (because the high water mark is 0) already cleared the write event, so
-            # this waits until this call's own datagram has been handed to the OS.
-            # The event may also have been set by error_received() while the transport
-            # is still paused, so keep waiting until writing is actually resumed.
-            while self._protocol.write_paused:
-                await self._protocol.write_event.wait()
-                if self._closed:
-                    raise ClosedResourceError
-                elif (exc := self._protocol.take_exception()) is not None:
+                # If the OS refused the datagram, the transport has buffered it and
+                # (because the high water mark is 0) paused writing, so this waits
+                # until this call's own datagram has been handed to the OS. An error
+                # reported by the transport wakes us up too.
+                while self._protocol.write_paused:
+                    await self._protocol.wait_writable()
+                    if self._closed:
+                        raise ClosedResourceError
+                    elif (exc := self._protocol.take_exception()) is not None:
+                        raise BrokenResourceError from exc
+                    elif self._transport.is_closing():
+                        raise BrokenResourceError
+
+                # A send that fails right away is reported to the protocol; raise it
+                # here instead of leaving it for another task to pick up, as the Trio
+                # backend does
+                if (exc := self._protocol.take_exception()) is not None:
                     raise BrokenResourceError from exc
-                elif self._transport.is_closing():
-                    raise BrokenResourceError
-
-            # A send that fails right away is reported to the protocol; raise it here
-            # instead of leaving it for another task to pick up, as the Trio backend
-            # does
-            if (exc := self._protocol.take_exception()) is not None:
-                raise BrokenResourceError from exc
 
 
 class ConnectedUDPSocket(abc.ConnectedUDPSocket):
@@ -1802,8 +1832,8 @@ class ConnectedUDPSocket(abc.ConnectedUDPSocket):
             await AsyncIOBackend.checkpoint()
 
             # Wait until there's a packet in the buffer. An error reported by the
-            # transport also wakes us up, but it may have been claimed by a sender
-            # already, in which case there's nothing to do but wait for more data.
+            # transport also wakes us up, but a send started in the meantime may have
+            # claimed it, in which case there's nothing to do but wait for more data.
             while not self._protocol.read_queue:
                 if self._closed:
                     raise ClosedResourceError
@@ -1812,8 +1842,7 @@ class ConnectedUDPSocket(abc.ConnectedUDPSocket):
                 elif self._transport.is_closing():
                     raise BrokenResourceError
 
-                self._protocol.read_event.clear()
-                await self._protocol.read_event.wait()
+                await self._protocol.wait_readable()
 
             packet = self._protocol.read_queue.popleft()
             return packet[0]
@@ -1828,27 +1857,27 @@ class ConnectedUDPSocket(abc.ConnectedUDPSocket):
             elif self._transport.is_closing():
                 raise BrokenResourceError
 
-            self._transport.sendto(item)
+            with self._protocol.sending():
+                self._transport.sendto(item)
 
-            # If the OS refused the datagram, the transport has buffered it and
-            # (because the high water mark is 0) already cleared the write event, so
-            # this waits until this call's own datagram has been handed to the OS.
-            # The event may also have been set by error_received() while the transport
-            # is still paused, so keep waiting until writing is actually resumed.
-            while self._protocol.write_paused:
-                await self._protocol.write_event.wait()
-                if self._closed:
-                    raise ClosedResourceError
-                elif (exc := self._protocol.take_exception()) is not None:
+                # If the OS refused the datagram, the transport has buffered it and
+                # (because the high water mark is 0) paused writing, so this waits
+                # until this call's own datagram has been handed to the OS. An error
+                # reported by the transport wakes us up too.
+                while self._protocol.write_paused:
+                    await self._protocol.wait_writable()
+                    if self._closed:
+                        raise ClosedResourceError
+                    elif (exc := self._protocol.take_exception()) is not None:
+                        raise BrokenResourceError from exc
+                    elif self._transport.is_closing():
+                        raise BrokenResourceError
+
+                # A send that fails right away is reported to the protocol; raise it
+                # here instead of leaving it for another task to pick up, as the Trio
+                # backend does
+                if (exc := self._protocol.take_exception()) is not None:
                     raise BrokenResourceError from exc
-                elif self._transport.is_closing():
-                    raise BrokenResourceError
-
-            # A send that fails right away is reported to the protocol; raise it here
-            # instead of leaving it for another task to pick up, as the Trio backend
-            # does
-            if (exc := self._protocol.take_exception()) is not None:
-                raise BrokenResourceError from exc
 
 
 class UNIXDatagramSocket(_RawSocketMixin, abc.UNIXDatagramSocket):

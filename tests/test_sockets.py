@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import array
+import asyncio
 import errno
 import gc
 import io
@@ -2505,39 +2506,48 @@ class TestConnectedUDPSocket:
 
 
 @pytest.mark.parametrize("anyio_backend", asyncio_params)
-async def test_datagram_protocol_restores_back_pressure() -> None:
+async def test_datagram_protocol_wakes_up_one_waiter() -> None:
     """
-    ``error_received()`` wakes up a sender waiting on the write event, but if the
-    transport is still paused, the event has to be cleared again once the error has
-    been raised, or the back-pressure would be lost.
+    Only one task can claim an error reported by the transport, so only one may be
+    woken up by it: the sender if a send is in progress, and the receiver otherwise.
 
-    This can only be tested directly, as pausing a datagram transport requires the OS
-    to refuse datagrams, which loopback UDP sockets never do.
+    This can only be tested directly, as it requires both a receiver and a sender to
+    be waiting on a transport that reports an error at that exact moment.
     """
     from anyio._backends._asyncio import DatagramProtocol
 
+    loop = asyncio.get_running_loop()
     protocol = DatagramProtocol()
     protocol.connection_made(MagicMock())
     protocol.pause_writing()
-    assert not protocol.write_event.is_set()
+    protocol.read_future = read_future = loop.create_future()
+    protocol.write_future = write_future = loop.create_future()
 
-    # The sender must be woken up by the error
+    # With no send in progress, the error is meant for the receiver
     protocol.error_received(ConnectionRefusedError())
-    assert protocol.write_event.is_set()
+    assert read_future.done()
+    assert not write_future.done()
 
-    # Errors are queued, so a second one doesn't displace the first
-    protocol.error_received(ConnectionResetError())
+    # ...and with one, for the sender, so that it isn't handed to a receiver waiting
+    # for a datagram
+    protocol.read_future = read_future = loop.create_future()
+    with protocol.sending():
+        protocol.error_received(ConnectionResetError())
 
-    # ...but the sender is only woken up to raise them, after which it must wait for
-    # the transport again
+    assert write_future.done()
+    assert not read_future.done()
+
+    # Errors are queued, so the second one didn't displace the first, and the sender
+    # still has to wait for the transport to drain after raising them
     assert isinstance(protocol.take_exception(), ConnectionRefusedError)
-    assert protocol.write_event.is_set()
     assert isinstance(protocol.take_exception(), ConnectionResetError)
     assert protocol.take_exception() is None
-    assert not protocol.write_event.is_set()
+    assert protocol.write_paused
 
+    protocol.write_future = write_future = loop.create_future()
     protocol.resume_writing()
-    assert protocol.write_event.is_set()
+    assert write_future.done()
+    assert not protocol.write_paused
 
 
 @pytest.mark.skipif(
