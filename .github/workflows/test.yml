@@ -124,8 +124,10 @@ jobs:
       run: |
         compgen -G "/tmp/core.*" > /dev/null || exit 0
         sudo apt-get install -y gdb
+        pyver=$(python -c 'import platform; print(platform.python_version())')
+        curl -fsSL -o /tmp/libpython.py "https://raw.githubusercontent.com/python/cpython/v${pyver}/Tools/gdb/libpython.py"
         for core in /tmp/core.*; do
-          gdb -batch -ex "thread apply all bt" "$(which python)" "$core"
+          gdb -batch -ex "source /tmp/libpython.py" -ex "thread apply all bt" -ex "thread apply all py-bt" "$(which python)" "$core"
         done
     - name: Upload core dumps
       if: failure() && runner.os == 'Linux'
