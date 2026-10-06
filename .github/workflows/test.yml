@@ -95,8 +95,8 @@ jobs:
       run: |
         pip install uv
         uv pip install --system --resolution lowest-direct --group test -e .${{ matrix.extras }}
-    - name: Install blockbuster from the fix-cyclic-gc-contextvar-set-reset branch
-      run: pip install "blockbuster @ git+https://github.com/graingert/blockbuster@fix-cyclic-gc-contextvar-set-reset"
+    - name: Install blockbuster from the replace-contextvar-with-threading-local branch
+      run: pip install "blockbuster @ git+https://github.com/graingert/blockbuster@replace-contextvar-with-threading-local"
     - name: Patch /etc/hosts
       if: runner.os != 'Windows'
       run: |
