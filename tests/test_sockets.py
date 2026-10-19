@@ -2071,6 +2071,19 @@ class TestUDPSocket:
         with pytest.raises(ClosedResourceError):
             await udp.receive()
 
+    @pytest.mark.parametrize("anyio_backend", asyncio_params)
+    async def test_receive_after_close_with_buffered_packet(
+        self, family: AnyIPAddressFamily
+    ) -> None:
+        # The datagram is handed to the protocol directly, as a real one may not
+        # have been read by the transport yet when the socket is closed
+        host = "127.0.0.1" if family == socket.AF_INET else "::1"
+        udp = await create_udp_socket(family=family, local_host=host)
+        cast(Any, udp)._protocol.datagram_received(b"blah", (host, 5000))
+        await udp.aclose()
+        with pytest.raises(ClosedResourceError):
+            await udp.receive()
+
     async def test_send_after_close(self) -> None:
         udp = await create_udp_socket(
             family=AddressFamily.AF_INET, local_host="localhost"
@@ -2297,6 +2310,19 @@ class TestConnectedUDPSocket:
         udp = await create_connected_udp_socket(
             "localhost", 5000, local_host="localhost", family=family
         )
+        await udp.aclose()
+        with pytest.raises(ClosedResourceError):
+            await udp.receive()
+
+    @pytest.mark.parametrize("anyio_backend", asyncio_params)
+    async def test_receive_after_close_with_buffered_packet(
+        self, family: AnyIPAddressFamily
+    ) -> None:
+        # The datagram is handed to the protocol directly, as a real one may not
+        # have been read by the transport yet when the socket is closed
+        host = "127.0.0.1" if family == socket.AF_INET else "::1"
+        udp = await create_connected_udp_socket(host, 5000, family=family)
+        cast(Any, udp)._protocol.datagram_received(b"blah", (host, 5000))
         await udp.aclose()
         with pytest.raises(ClosedResourceError):
             await udp.receive()

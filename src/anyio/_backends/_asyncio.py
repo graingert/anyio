@@ -1790,6 +1790,11 @@ class UDPSocket(abc.UDPSocket):
         with self._receive_guard:
             await AsyncIOBackend.checkpoint()
 
+            # Any buffered packets were discarded when the socket was closed, just like
+            # the OS discards them
+            if self._closed:
+                raise ClosedResourceError
+
             # If the buffer is empty, ask for more data
             if not self._protocol.read_queue and not self._transport.is_closing():
                 self._protocol.read_event.clear()
@@ -1851,6 +1856,11 @@ class ConnectedUDPSocket(abc.ConnectedUDPSocket):
     async def receive(self) -> bytes:
         with self._receive_guard:
             await AsyncIOBackend.checkpoint()
+
+            # Any buffered packets were discarded when the socket was closed, just like
+            # the OS discards them
+            if self._closed:
+                raise ClosedResourceError
 
             # If the buffer is empty, ask for more data
             if not self._protocol.read_queue and not self._transport.is_closing():
