@@ -2609,6 +2609,22 @@ class TestUDPSocket:
         with pytest.raises(ClosedResourceError):
             await udp.receive()
 
+    @pytest.mark.parametrize("anyio_backend", asyncio_params)
+    async def test_receive_reports_error_before_buffered_packet(
+        self, family: AnyIPAddressFamily
+    ) -> None:
+        # The OS reports a pending error before any packets already received
+        host = "127.0.0.1" if family == socket.AF_INET else "::1"
+        async with await create_udp_socket(family=family, local_host=host) as udp:
+            protocol = cast(Any, udp)._protocol
+            protocol.datagram_received(b"blah", (host, 5000))
+            protocol.error_received(ConnectionRefusedError())
+            with pytest.raises(BrokenResourceError) as exc_info:
+                await udp.receive()
+
+            assert isinstance(exc_info.value.__cause__, ConnectionRefusedError)
+            assert await udp.receive() == (b"blah", (host, 5000))
+
     async def test_send_after_close(self) -> None:
         udp = await create_udp_socket(
             family=AddressFamily.AF_INET, local_host="localhost"
@@ -3109,6 +3125,22 @@ class TestConnectedUDPSocket:
         await udp.aclose()
         with pytest.raises(ClosedResourceError):
             await udp.receive()
+
+    @pytest.mark.parametrize("anyio_backend", asyncio_params)
+    async def test_receive_reports_error_before_buffered_packet(
+        self, family: AnyIPAddressFamily
+    ) -> None:
+        # The OS reports a pending error before any packets already received
+        host = "127.0.0.1" if family == socket.AF_INET else "::1"
+        async with await create_connected_udp_socket(host, 5000, family=family) as udp:
+            protocol = cast(Any, udp)._protocol
+            protocol.datagram_received(b"blah", (host, 5000))
+            protocol.error_received(ConnectionRefusedError())
+            with pytest.raises(BrokenResourceError) as exc_info:
+                await udp.receive()
+
+            assert isinstance(exc_info.value.__cause__, ConnectionRefusedError)
+            assert await udp.receive() == b"blah"
 
     async def test_send_after_close(self, family: AnyIPAddressFamily) -> None:
         udp = await create_connected_udp_socket(

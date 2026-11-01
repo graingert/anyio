@@ -1910,11 +1910,14 @@ class UDPSocket(abc.UDPSocket):
         with self._receive_guard:
             await AsyncIOBackend.checkpoint()
 
-            # Wait until there's a packet in the buffer. An error reported by the
+            # Wait until there's a packet in the buffer. A pending error takes priority
+            # over buffered packets, as it does in the OS. An error reported by the
             # transport also wakes us up, but it may have been claimed by a sender
             # already, in which case there's nothing to do but wait for more data.
-            while not self._protocol.read_queue:
-                if self._closed:
+            while True:
+                if self._protocol.read_queue and not self._protocol.exceptions:
+                    break
+                elif self._closed:
                     raise ClosedResourceError
                 elif (exc := self._protocol.take_exception()) is not None:
                     raise BrokenResourceError from exc
@@ -1991,11 +1994,14 @@ class ConnectedUDPSocket(abc.ConnectedUDPSocket):
         with self._receive_guard:
             await AsyncIOBackend.checkpoint()
 
-            # Wait until there's a packet in the buffer. An error reported by the
+            # Wait until there's a packet in the buffer. A pending error takes priority
+            # over buffered packets, as it does in the OS. An error reported by the
             # transport also wakes us up, but it may have been claimed by a sender
             # already, in which case there's nothing to do but wait for more data.
-            while not self._protocol.read_queue:
-                if self._closed:
+            while True:
+                if self._protocol.read_queue and not self._protocol.exceptions:
+                    break
+                elif self._closed:
                     raise ClosedResourceError
                 elif (exc := self._protocol.take_exception()) is not None:
                     raise BrokenResourceError from exc
